@@ -196,18 +196,33 @@ MODE 1 - DIGEST (call with just `file`, optionally `sections`)
   Sections (auto-skip when empty, so absence is itself information):
     summary   packets, duration, and the list of protocols present
     proto     protocol hierarchy (indent = encapsulation depth; frames/bytes/layer)
+    hosts     NETWORK INVENTORY: IP <-> MAC <-> hostname, correlated from Ethernet,
+              ARP, DHCP, and DNS. The "what's on this network" map.
     flows     top TCP/UDP flows as "proto/STREAMID  a <-> b  pkts/bytes  SNI".
               The STREAMID is what you pass to follow a stream.
     tls       TLS/QUIC SNI (server names contacted, with hello counts) + versions.
               On an all-HTTPS capture this is your main intel: who was contacted.
     dns       DNS queries -> answers.
-    http      HTTP requests (METHOD host/uri) and responses (status).
+    http      requests/responses + user-agents seen + server banners.
+    dhcp      DHCP leases: MAC, hostname, IP, vendor class (device fingerprinting).
+    files     filenames/objects transferred over HTTP/SMB/TFTP/FTP.
+    voip      SIP signaling (method/parties/status) + RTP stream quality (loss/jitter).
     services  service/host discovery: mDNS, LLMNR, NBNS, SSDP.
     arp       ARP who-has/is-at (L2 host map; also useful on monitor-mode captures).
-    wifi      802.11 beacons (SSID/BSSID/channel) + probe requests — appears only
-              on monitor-mode captures.
-    creds     heuristic cleartext creds: HTTP basic/POST, FTP, Telnet, SMTP/IMAP/POP.
-  Narrow with sections (e.g. "tls,flows,creds") on large captures to save tokens.
+    wifi      802.11 beacons + probe requests. HIDDEN (cloaked) SSIDs are uncovered
+              by correlating the BSSID with probe-responses/association-requests
+              ([SSID REVEALED]). Also flags captured WPA/WPA2 EAPOL handshakes
+              (crackable offline). Appears only on monitor-mode captures.
+    creds     LOOT: cleartext logins (HTTP/FTP/Telnet/IMAP/POP/SMTP), SNMP community
+              strings, Kerberos principals/SPNs, and CRACKABLE net-NTLM hashes
+              formatted for hashcat (v1=mode 5500, v2=mode 5600 — noted per line).
+  Narrow with sections (e.g. "creds,hosts,files") on large captures to save tokens.
+
+  KEY LOOT TO ACT ON: a "creds" line like
+    "[ntlmv2] user::DOMAIN:chal:proof:blob  (hashcat -m 5600)"
+  is a ready-to-crack hash — copy the value into a file and run the noted hashcat
+  mode with a wordlist. SNMP community strings and IMAP/telnet logins are often
+  directly usable. Kerberos SPNs are kerberoast targets.
 
 MODE 2 - FOLLOW A STREAM (set `stream`)
   stream="5" follows TCP stream 5; stream="udp:3" follows UDP stream 3. Returns the

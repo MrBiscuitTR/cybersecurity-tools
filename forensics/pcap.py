@@ -57,7 +57,8 @@ import sys
 from common import proc
 from common.output import emit, log
 
-SECTIONS = ("summary", "proto", "flows", "tls", "dns", "http", "services", "arp", "wifi", "creds")
+SECTIONS = ("summary", "proto", "hosts", "flows", "tls", "dns", "http", "dhcp",
+            "files", "voip", "services", "arp", "wifi", "creds")
 DEFAULT_SECTIONS = SECTIONS
 _SEP = "\x1f"  # unit separator: safe column delimiter for -T fields
 
@@ -208,20 +209,26 @@ def _dns(bin_: str, path: str) -> list[dict]:
     return out
 
 
-def _http(bin_: str, path: str) -> list[dict]:
+def _http(bin_: str, path: str) -> dict:
+    """HTTP requests/responses plus recon-relevant metadata: user-agents seen
+    (client fingerprinting) and server banners."""
+    transactions = []
     rows = _fields(bin_, path,
                    ["http.request.method", "http.host", "http.request.uri",
                     "http.response.code", "http.response.phrase"],
                    "http.request || http.response")
-    out = []
     for r in rows:
         r += [""] * (5 - len(r))
         method, host, uri, code, phrase = r[:5]
         if method:
-            out.append({"kind": "req", "method": method, "host": host, "uri": uri})
+            transactions.append({"kind": "req", "method": method, "host": host, "uri": uri})
         elif code:
-            out.append({"kind": "resp", "status": code, "phrase": phrase})
-    return out
+            transactions.append({"kind": "resp", "status": code, "phrase": phrase})
+    user_agents = sorted({r[0] for r in _fields(bin_, path, ["http.user_agent"],
+                          "http.user_agent") if r and r[0]})
+    servers = sorted({r[0] for r in _fields(bin_, path, ["http.server"], "http.server")
+                      if r and r[0]})
+    return {"transactions": transactions[:200], "user_agents": user_agents, "servers": servers}
 
 
 def _services(bin_: str, path: str) -> list[dict]:
@@ -278,6 +285,20 @@ def _decode_ssid(raw: str) -> str:
 
 
 def _wifi(bin_: str, path: str) -> dict:
+    """802.11 recon. Beacons list APs; hidden (cloaked) SSIDs are UNCOVERED by
+    correlating the BSSID with probe responses and association requests, where a
+    connecting client leaks the real name. EAPOL frames mean a WPA/WPA2 4-way
+    handshake was captured (crackable offline with the right wordlist)."""
+    # BSSID -> real SSID, learned from any frame type that carries a real name.
+    revealed: dict[str, str] = {}
+    for subtype in ("0x05", "0x00", "0x02", "0x08"):   # proberesp, assocreq, reassocreq, beacon
+        for r in _fields(bin_, path, ["wlan.bssid", "wlan.ssid"],
+                         f"wlan.fc.type_subtype=={subtype}"):
+            r += [""] * (2 - len(r))
+            bssid, name = r[0], _decode_ssid(r[1])
+            if bssid and name != "<hidden>":
+                revealed.setdefault(bssid, name)
+
     beacons, seen_b = [], set()
     for r in _fields(bin_, path, ["wlan.ssid", "wlan.bssid", "wlan_radio.channel"],
                      "wlan.fc.type_subtype==0x08"):
@@ -285,7 +306,13 @@ def _wifi(bin_: str, path: str) -> dict:
         ssid, bssid, chan = r[:3]
         if bssid and bssid not in seen_b:
             seen_b.add(bssid)
-            beacons.append({"ssid": _decode_ssid(ssid), "bssid": bssid, "channel": chan})
+            beacon_ssid = _decode_ssid(ssid)
+            hidden = beacon_ssid == "<hidden>"
+            beacons.append({"bssid": bssid, "channel": chan,
+                            "ssid": revealed.get(bssid, beacon_ssid),
+                            "hidden": hidden,
+                            "revealed": hidden and bssid in revealed})
+
     probes, seen_p = [], set()
     for r in _fields(bin_, path, ["wlan.ssid", "wlan.sa"], "wlan.fc.type_subtype==0x04"):
         r += [""] * (2 - len(r))
@@ -294,40 +321,247 @@ def _wifi(bin_: str, path: str) -> dict:
         if key not in seen_p:
             seen_p.add(key)
             probes.append({"ssid": _decode_ssid(ssid), "station": sa})
-    return {"beacons": beacons, "probe_requests": probes}
+
+    # WPA handshake detection: which BSSIDs have EAPOL key frames.
+    handshakes = sorted({r[0] for r in _fields(bin_, path, ["wlan.bssid"], "eapol") if r and r[0]})
+    return {"beacons": beacons, "probe_requests": probes, "wpa_handshakes": handshakes}
 
 
 def _creds(bin_: str, path: str) -> list[dict]:
+    """Extract credentials/loot an operator can actually use: cleartext logins,
+    crackable net-NTLM hashes, SNMP community strings, Kerberos principals, etc.
+    Heuristic — every hit is a lead to confirm, but many are directly usable."""
     found: list[dict] = []
+    seen: set = set()
 
-    def add(kind, **kw):
-        found.append({"kind": kind, **kw})
+    def add(kind, value, **kw):
+        key = (kind, value)
+        if value and key not in seen:
+            seen.add(key)
+            found.append({"kind": kind, "value": value, **kw})
 
+    # --- net-NTLM (crackable with hashcat: v2=mode 5600, v1=mode 5500) ---
+    # The server challenge (Type-2 CHALLENGE) and the client response (Type-3
+    # AUTHENTICATE) are in different packets, so correlate them by TCP stream.
+    challenges: dict[str, str] = {}
+    for r in _fields(bin_, path, ["tcp.stream", "ntlmssp.ntlmserverchallenge"],
+                     "ntlmssp.messagetype==0x00000002"):
+        if len(r) >= 2 and r[0] and r[1]:
+            challenges[r[0]] = r[1]
+    for r in _fields(bin_, path,
+                     ["tcp.stream", "ntlmssp.auth.domain", "ntlmssp.auth.username",
+                      "ntlmssp.auth.ntresponse", "ntlmssp.auth.lmresponse"],
+                     "ntlmssp.messagetype==0x00000003"):
+        r += [""] * (5 - len(r))
+        stream, domain, user, ntresp, lmresp = r[:5]
+        chal = challenges.get(stream, "")
+        if not (user and ntresp and chal) or user.upper() == "NULL":
+            continue  # skip anonymous/null sessions (not crackable, not useful)
+        if len(ntresp) > 48:                       # NTLMv2: 16B NTProofStr + blob
+            proof, blob = ntresp[:32], ntresp[32:]
+            add("ntlmv2", f"{user}::{domain}:{chal}:{proof}:{blob}", note="hashcat -m 5600")
+        else:                                      # NTLMv1
+            lm = lmresp or ntresp
+            add("ntlmv1", f"{user}::{domain}:{lm}:{ntresp}:{chal}", note="hashcat -m 5500")
+
+    # --- SNMP community strings (community == password) + SNMPv3 users ---
+    for r in _fields(bin_, path, ["snmp.community"], "snmp.community"):
+        if r and r[0]:
+            add("snmp-community", r[0])
+    for r in _fields(bin_, path, ["snmp.msgUserName"], "snmp.msgUserName"):
+        if r and r[0]:
+            add("snmpv3-user", r[0])
+
+    # --- cleartext mail/login protocols ---
+    for r in _fields(bin_, path, ["imap.request"], "imap.request"):
+        if r and r[0] and "login" in r[0].lower():
+            add("imap", r[0].strip()[:200])
+    for r in _fields(bin_, path, ["pop.request.command", "pop.request.parameter"],
+                     'pop.request.command=="USER" || pop.request.command=="PASS"'):
+        r += [""] * (2 - len(r))
+        add("pop", f"{r[0]} {r[1]}".strip())
+    for r in _fields(bin_, path, ["smtp.req.parameter"], 'smtp.req.command=="AUTH"'):
+        if r and r[0]:
+            add("smtp-auth", r[0][:200])
+
+    # --- Kerberos principals (kerberoast / AS-REP-roast leads) ---
+    for r in _fields(bin_, path, ["kerberos.CNameString", "kerberos.realm"],
+                     "kerberos.CNameString"):
+        r += [""] * (2 - len(r))
+        if r[0] and not r[0].endswith("$"):        # skip machine accounts
+            add("kerberos-user", f"{r[0]}@{r[1]}")
+    for r in _fields(bin_, path, ["kerberos.SNameString"], "kerberos.SNameString"):
+        if r and r[0] and "/" in r[0]:             # SPNs are kerberoastable
+            add("kerberos-spn", r[0])
+
+    # --- RADIUS ---
+    for r in _fields(bin_, path, ["radius.User_Name"], "radius.User_Name"):
+        if r and r[0]:
+            add("radius-user", r[0])
+
+    # --- HTTP auth / form posts / cookies ---
     for r in _fields(bin_, path, ["http.authorization", "http.host"], "http.authorization"):
         if r and r[0]:
-            add("http-authorization", host=r[1] if len(r) > 1 else "", value=r[0])
-    for r in _fields(bin_, path, ["http.host", "http.file_data"],
-                     'http.request.method=="POST"'):
+            add("http-authorization", r[0], host=r[1] if len(r) > 1 else "")
+    for r in _fields(bin_, path, ["http.host", "http.file_data"], 'http.request.method=="POST"'):
         if len(r) > 1 and r[1] and ("pass" in r[1].lower() or "pwd" in r[1].lower()):
-            add("http-post", host=r[0], value=r[1][:300])
+            add("http-post", r[1][:300], host=r[0])
+
+    # --- FTP / Telnet ---
     for r in _fields(bin_, path, ["ftp.request.command", "ftp.request.arg"],
                      'ftp.request.command=="USER" || ftp.request.command=="PASS"'):
         if r and r[0]:
-            add("ftp", value=f"{r[0]} {r[1] if len(r) > 1 else ''}".strip())
-    for r in _fields(bin_, path, ["telnet.data"], "telnet.data matches \"(?i)(login|password)\""):
+            add("ftp", f"{r[0]} {r[1] if len(r) > 1 else ''}".strip())
+    for r in _fields(bin_, path, ["telnet.data"], 'telnet.data matches "(?i)(login|password)"'):
         if r and r[0]:
-            add("telnet", value=r[0][:200])
-    for r in _fields(bin_, path, ["imf.extension.value"], "pop.request.parameter"):
-        pass  # placeholder; POP creds captured below
-    for filt, field, kind in (
-        ('smtp.req.command=="AUTH"', "smtp.req.parameter", "smtp-auth"),
-        ("pop.request.command", "pop.request.parameter", "pop"),
-        ("imap.request", "imap.request", "imap"),
-    ):
-        for r in _fields(bin_, path, [field], filt):
-            if r and r[0] and any(k in r[0].lower() for k in ("user", "pass", "login", "auth")):
-                add(kind, value=r[0][:200])
+            add("telnet", r[0].strip()[:200])
     return found
+
+
+def _hosts(bin_: str, path: str) -> list[dict]:
+    """Build a host inventory (network map): IP <-> MAC <-> hostname, correlated
+    from Ethernet, ARP, DHCP, and DNS. The single most useful 'what's on this
+    network' view."""
+    macs: dict[str, set] = {}
+    names: dict[str, set] = {}
+    _skip_ip = {"", "0.0.0.0", "255.255.255.255", "::"}
+    _skip_mac = {"", "ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"}
+
+    def _real_host(ip: str) -> bool:
+        if ip in _skip_ip:
+            return False
+        first = ip.split(".")[0]
+        return not (first.isdigit() and 224 <= int(first) <= 255)  # drop multicast/broadcast
+
+    def bind_mac(ip, mac):
+        if not _real_host(ip):
+            return
+        for m in (mac or "").split(","):            # a field may carry >1 value
+            if m and m not in _skip_mac:
+                macs.setdefault(ip, set()).add(m)
+
+    def bind_name(ip, name):
+        if _real_host(ip) and name:
+            names.setdefault(ip, set()).add(name)
+
+    for r in _fields(bin_, path, ["ip.src", "eth.src", "ip.dst", "eth.dst"], "ip && eth"):
+        r += [""] * (4 - len(r))
+        bind_mac(r[0], r[1])
+        bind_mac(r[2], r[3])
+    for r in _fields(bin_, path, ["arp.src.proto_ipv4", "arp.src.hw_mac"], "arp"):
+        r += [""] * (2 - len(r))
+        bind_mac(r[0], r[1])
+    # DHCP: assigned IP + client MAC + hostname.
+    for r in _fields(bin_, path, ["dhcp.ip.your", "dhcp.hw.mac_addr", "dhcp.option.hostname"],
+                     "dhcp"):
+        r += [""] * (3 - len(r))
+        bind_mac(r[0], r[1])
+        bind_name(r[0], r[2])
+    # DNS A answers: hostname -> IP.
+    for r in _fields(bin_, path, ["dns.qry.name", "dns.a"], "dns.a && dns.flags.response==1"):
+        if len(r) >= 2 and r[0] and r[1]:
+            for ip in r[1].split(","):
+                bind_name(ip.strip(), r[0])
+
+    hosts = []
+    for ip in sorted(set(macs) | set(names), key=_ip_key):
+        hosts.append({"ip": ip, "macs": sorted(macs.get(ip, [])),
+                      "hostnames": sorted(names.get(ip, []))[:8]})
+    return hosts
+
+
+def _ip_key(ip: str):
+    parts = ip.split(".")
+    return tuple(int(p) for p in parts) if len(parts) == 4 and all(p.isdigit() for p in parts) else (999,)
+
+
+def _dhcp(bin_: str, path: str) -> list[dict]:
+    """DHCP leases/requests: MAC, hostname, requested/assigned IP, vendor class
+    (device fingerprinting)."""
+    out, seen = [], set()
+    for r in _fields(bin_, path,
+                     ["dhcp.hw.mac_addr", "dhcp.option.hostname",
+                      "dhcp.option.requested_ip_address", "dhcp.ip.your",
+                      "dhcp.option.vendor_class_id"], "dhcp"):
+        r += [""] * (5 - len(r))
+        mac, host, req_ip, your_ip, vendor = r[:5]
+        ip = your_ip or req_ip
+        key = (mac, host, ip, vendor)
+        if mac and key not in seen:
+            seen.add(key)
+            out.append({"mac": mac, "hostname": host, "ip": ip, "vendor": vendor})
+    return out
+
+
+def _files(bin_: str, path: str) -> list[dict]:
+    """Filenames/objects transferred: HTTP URIs & downloads, SMB files, TFTP, FTP."""
+    out, seen = [], set()
+
+    def add(proto, name):
+        name = (name or "").strip()
+        if name and (proto, name) not in seen:
+            seen.add((proto, name))
+            out.append({"proto": proto, "name": name})
+
+    for r in _fields(bin_, path, ["http.host", "http.request.uri"], "http.request.uri"):
+        r += [""] * (2 - len(r))
+        uri = r[1]
+        if uri and ("." in uri.rsplit("/", 1)[-1]):   # looks like it ends in a file
+            add("http", f"{r[0]}{uri}"[:200])
+    for r in _fields(bin_, path, ["http.content_disposition"], "http.content_disposition"):
+        if r and r[0] and "filename" in r[0].lower():
+            add("http-download", r[0][:150])
+    for r in _fields(bin_, path, ["smb2.filename"], "smb2.filename"):
+        if r and r[0]:
+            add("smb", r[0])
+    for r in _fields(bin_, path, ["smb.file"], "smb.file"):
+        if r and r[0]:
+            add("smb", r[0])
+    for r in _fields(bin_, path, ["tftp.source_file", "tftp.destination_file"], "tftp"):
+        r += [""] * (2 - len(r))
+        add("tftp", r[0] or r[1])
+    for r in _fields(bin_, path, ["ftp.request.arg"],
+                     'ftp.request.command=="RETR" || ftp.request.command=="STOR"'):
+        if r and r[0]:
+            add("ftp", r[0])
+    return out
+
+
+def _voip(bin_: str, path: str) -> dict:
+    """VoIP: SIP signaling (methods/parties/status) and RTP stream quality."""
+    calls = []
+    for r in _fields(bin_, path,
+                     ["sip.Method", "sip.From.user", "sip.To.user",
+                      "sip.Status-Code", "sip.CSeq.method"], "sip"):
+        r += [""] * (5 - len(r))
+        method, frm, to, status, cseq = r[:5]
+        if method:
+            calls.append({"type": "request", "method": method, "from": frm,
+                          "to": to, "for": cseq})
+        elif status:
+            calls.append({"type": "response", "status": status, "for": cseq})
+    # RTP stream quality via -z (SSRC, endpoints, loss, jitter).
+    rtp = []
+    text = _z(bin_, path, "rtp,streams")
+    for line in text.splitlines():
+        s = line.split()
+        # data rows start with two float timestamps.
+        if len(s) >= 10 and _isfloat(s[0]) and _isfloat(s[1]):
+            try:
+                rtp.append({"src": f"{s[2]}:{s[3]}", "dst": f"{s[4]}:{s[5]}",
+                            "ssrc": s[6], "payload": s[7], "packets": s[8],
+                            "lost": " ".join(s[9:11]) if "%" in line else s[9]})
+            except IndexError:
+                continue
+    return {"calls": calls, "rtp_streams": rtp}
+
+
+def _isfloat(s: str) -> bool:
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
 
 
 # --- drill-down modes -------------------------------------------------------
@@ -397,32 +631,33 @@ def run(path: str, *, sections: list[str] | None = None, tshark: str | None = No
     present = set(_protocols_present(proto_lines))
     out: dict[str, object] = {}
     for name in want:
-        # Skip L2/wifi sections when their protocols aren't in the capture (saves work).
+        # Skip sections whose protocols aren't in the capture (saves work).
         if name == "wifi" and not (present & {"wlan", "wlan_radio", "wlan_mgt"}):
             continue
         if name == "arp" and "arp" not in present:
             continue
+        if name == "dhcp" and not (present & {"dhcp", "bootp"}):
+            continue
+        if name == "voip" and not (present & {"sip", "rtp", "rtcp", "rtp-midi"}):
+            continue
         log(f"[*] {name} ...")
-        if name == "summary":
-            out[name] = _summary(bin_, path, proto_lines)
-        elif name == "proto":
-            out[name] = proto_lines
-        elif name == "flows":
-            out[name] = _flows(bin_, path)
-        elif name == "tls":
-            out[name] = _tls(bin_, path)
-        elif name == "dns":
-            out[name] = _dns(bin_, path)
-        elif name == "http":
-            out[name] = _http(bin_, path)
-        elif name == "services":
-            out[name] = _services(bin_, path)
-        elif name == "arp":
-            out[name] = _arp(bin_, path)
-        elif name == "wifi":
-            out[name] = _wifi(bin_, path)
-        elif name == "creds":
-            out[name] = _creds(bin_, path)
+        builders = {
+            "summary": lambda: _summary(bin_, path, proto_lines),
+            "proto": lambda: proto_lines,
+            "hosts": lambda: _hosts(bin_, path),
+            "flows": lambda: _flows(bin_, path),
+            "tls": lambda: _tls(bin_, path),
+            "dns": lambda: _dns(bin_, path),
+            "http": lambda: _http(bin_, path),
+            "dhcp": lambda: _dhcp(bin_, path),
+            "files": lambda: _files(bin_, path),
+            "voip": lambda: _voip(bin_, path),
+            "services": lambda: _services(bin_, path),
+            "arp": lambda: _arp(bin_, path),
+            "wifi": lambda: _wifi(bin_, path),
+            "creds": lambda: _creds(bin_, path),
+        }
+        out[name] = builders[name]()
     return {"file": path, "sections": out}
 
 
@@ -436,6 +671,10 @@ def _compact_lines(res: dict) -> list[str]:
     if "proto" in s:
         lines.append("## protocol hierarchy")
         lines += s["proto"]
+    if s.get("hosts"):
+        lines.append("## hosts (ip  mac  hostname)")
+        for h in s["hosts"]:
+            lines.append(f"{h['ip']}  {','.join(h['macs']) or '-'}  {','.join(h['hostnames'])}".rstrip())
     if s.get("flows"):
         lines.append("## flows (proto/stream  a <-> b  pkts/bytes  sni)")
         for f in s["flows"]:
@@ -453,10 +692,30 @@ def _compact_lines(res: dict) -> list[str]:
         lines.append("## dns")
         lines += [f"{d['query']} -> {d['answer']}" if d["answer"] else d["query"] for d in s["dns"]]
     if s.get("http"):
-        lines.append("## http")
-        for h in s["http"]:
-            lines.append(f"{h['method']} {h['host']}{h['uri']}".rstrip() if h["kind"] == "req"
-                         else f"<- {h['status']} {h.get('phrase','')}".rstrip())
+        h = s["http"]
+        if h["transactions"]:
+            lines.append("## http")
+            for t in h["transactions"]:
+                lines.append(f"{t['method']} {t['host']}{t['uri']}".rstrip() if t["kind"] == "req"
+                             else f"<- {t['status']} {t.get('phrase','')}".rstrip())
+        if h["user_agents"]:
+            lines.append("# user-agents: " + " | ".join(h["user_agents"][:10]))
+        if h["servers"]:
+            lines.append("# http servers: " + ", ".join(h["servers"][:10]))
+    if s.get("dhcp"):
+        lines.append("## dhcp (mac  ip  hostname  vendor)")
+        lines += [f"{d['mac']}  {d['ip']}  {d['hostname']}  {d['vendor']}".rstrip() for d in s["dhcp"]]
+    if s.get("files"):
+        lines.append("## files transferred")
+        lines += [f"[{f['proto']}] {f['name']}" for f in s["files"]]
+    if s.get("voip") and (s["voip"]["calls"] or s["voip"]["rtp_streams"]):
+        lines.append("## voip")
+        for c in s["voip"]["calls"]:
+            lines.append(f"SIP {c['method']} {c.get('from','')} -> {c.get('to','')}".rstrip()
+                         if c["type"] == "request" else f"SIP <- {c['status']} ({c.get('for','')})")
+        for r in s["voip"]["rtp_streams"]:
+            lines.append(f"RTP {r['src']} -> {r['dst']} ssrc={r['ssrc']} {r['payload']} "
+                         f"pkts={r['packets']} lost={r['lost']}")
     if s.get("services"):
         lines.append("## service discovery")
         lines += [f"[{x['proto']}] {x['name']}" for x in s["services"]]
@@ -465,12 +724,21 @@ def _compact_lines(res: dict) -> list[str]:
         lines += [f"{a['src_ip']} ({a['src_mac']}) {a['op']} {a['dst_ip']}".rstrip()
                   for a in s["arp"]]
     if s.get("wifi") and (s["wifi"]["beacons"] or s["wifi"]["probe_requests"]):
+        w = s["wifi"]
         lines.append("## wifi 802.11")
-        lines += [f"beacon  {b['ssid']}  {b['bssid']}  ch{b['channel']}" for b in s["wifi"]["beacons"]]
-        lines += [f"probe   {p['ssid']}  <- {p['station']}" for p in s["wifi"]["probe_requests"]]
+        for b in w["beacons"]:
+            tag = "  [SSID REVEALED]" if b.get("revealed") else ("  [hidden]" if b.get("hidden") else "")
+            lines.append(f"beacon  {b['ssid']}  {b['bssid']}  ch{b['channel']}{tag}")
+        lines += [f"probe   {p['ssid']}  <- {p['station']}" for p in w["probe_requests"]]
+        if w.get("wpa_handshakes"):
+            lines.append("# WPA/WPA2 EAPOL handshake captured (crackable) for: "
+                         + ", ".join(w["wpa_handshakes"]))
     if s.get("creds"):
-        lines.append("## POSSIBLE CLEARTEXT CREDS")
-        lines += [f"[{c['kind']}] {c.get('host','')} {c.get('value','')}".strip() for c in s["creds"]]
+        lines.append("## LOOT / POSSIBLE CREDS")
+        for c in s["creds"]:
+            note = f"  ({c['note']})" if c.get("note") else ""
+            host = f"{c['host']} " if c.get("host") else ""
+            lines.append(f"[{c['kind']}] {host}{c['value']}{note}".strip())
     return lines
 
 

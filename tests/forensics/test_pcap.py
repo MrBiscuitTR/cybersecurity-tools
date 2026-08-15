@@ -33,6 +33,31 @@ def test_sections_constant_covers_defaults():
     assert set(pcap.DEFAULT_SECTIONS) <= set(pcap.SECTIONS)
 
 
+def test_decode_ssid():
+    assert pcap._decode_ssid("696b65726972692d3567") == "ikeriri-5g"   # hex -> text
+    assert pcap._decode_ssid("") == "<hidden>"
+    assert pcap._decode_ssid("<MISSING>") == "<hidden>"
+    assert pcap._decode_ssid("00") == "<hidden>"                        # all-null cloaked
+
+
+def test_ip_key_sorts_numerically():
+    ips = ["192.168.0.10", "192.168.0.2", "10.0.0.1", "notanip"]
+    assert sorted(ips, key=pcap._ip_key)[:3] == ["10.0.0.1", "192.168.0.2", "192.168.0.10"]
+
+
+def test_compact_renders_loot_and_wifi():
+    res = {"file": "x.pcap", "sections": {
+        "creds": [{"kind": "ntlmv2", "value": "u::D:aa:bb:cc", "note": "hashcat -m 5600"}],
+        "wifi": {"beacons": [{"ssid": "corp", "bssid": "aa:bb", "channel": "6",
+                              "hidden": True, "revealed": True}],
+                 "probe_requests": [], "wpa_handshakes": ["aa:bb"]},
+    }}
+    lines = pcap._compact_lines(res)
+    assert any("hashcat -m 5600" in ln for ln in lines)
+    assert any("SSID REVEALED" in ln for ln in lines)
+    assert any("EAPOL handshake captured" in ln for ln in lines)
+
+
 @needs_tshark
 def test_digest_extracts_dns():
     res = pcap.run(FIXTURE, sections=["summary", "dns", "flows"], tshark=_tshark())
