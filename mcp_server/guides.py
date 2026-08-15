@@ -189,6 +189,108 @@ FAILURE / RETRY
   to resolve and have findable subdomains.
 """
 
+JWT = """\
+Decode, audit, verify, forge, and attack JSON Web Tokens. One tool with an
+`action` argument — PICK THE ACTION, then pass ONLY that action's fields (getting
+the field:value pairs right matters; see each action below). Local crypto only,
+nothing is sent anywhere. Supports algs: none, HS256/384/512, RS256/384/512,
+PS256/384/512, ES256/384/512, EdDSA.
+
+CHOOSE THE ACTION:
+  action="decode"  (default)  fields: token
+      Decode header+claims, decode exp/iat/nbf, and list weaknesses/attack surface.
+      START HERE for any token you're handed. No key needed.
+  action="verify"             fields: token, and ONE of: secret (HS*) | key_pem (RS/PS/ES/EdDSA public key PEM text)
+      Check whether a signature is valid for a given key. Use secret for HS*,
+      key_pem (public key) for the asymmetric families.
+  action="sign"               fields: alg, payload (JSON string), and ONE of: secret | key_pem (PRIVATE key PEM); optional header (JSON string)
+      Forge a token. HS*/none use secret; RS/PS/ES/EdDSA use key_pem (private key).
+  action="crack"              fields: token, wordlist (path to a wordlist file)
+      Brute-force an HS* secret. Only works on HS* tokens.
+  action="attack"             fields: token; optional public_key_pem, wordlist
+      Auto-run every applicable attack and return forged token candidates:
+      alg=none variants (always), RS->HS confusion (if you pass public_key_pem =
+      the server's RS/EC PUBLIC key PEM), and weak-secret crack (if you pass a wordlist).
+
+OUTPUT
+  decode: header + payload JSON, decoded timestamps, then "## FINDINGS" ranked
+    HIGH/MEDIUM/INFO (e.g. alg=none, jku/x5u/jwk headers, kid injection, no exp).
+  verify: "# verify: VALID/INVALID  alg=..  (reason)".
+  sign: the token string on stdout.
+  crack: the recovered secret or "not found".
+  attack: each candidate as "## <attack>" + the forged token + a note on when it works.
+
+HOW TO INTERPRET / THE INTUITION:
+  - alg=none HIGH means: if the server accepts unsigned tokens, use the attack
+    action's none token to become anyone. Try all case variants (none/None/NONE).
+  - HS* token + you suspect a weak key -> crack with a wordlist (rockyou), then sign
+    a new token with role/admin claims using the found secret.
+  - Server normally uses RS*/ES* but verifies sloppily -> RS->HS confusion: pass the
+    server's PUBLIC key as public_key_pem; the forged token is signed with HMAC using
+    that public key bytes as the secret. Works only if the server feeds the RS pubkey
+    into an HS verifier (a real, common bug).
+  - Header jku/x5u = the server may fetch keys from a URL you control (host your own
+    JWKS -> sign with your key). jwk = embedded key some libs blindly trust. kid =
+    often concatenated into a file path or SQL query (try ../ traversal, SQLi).
+  - To escalate: decode -> change the interesting claim (user/role/is_admin/sub) ->
+    re-sign (weak secret) or forge (none/confusion) -> replay against the server.
+
+WHAT TO DO NEXT
+  - Take a forged/re-signed token and replay it in the app's Authorization header
+    (only against an authorized target) to confirm the bypass.
+  - A JWT found by js_recon or in a capture feeds straight into decode/attack here.
+
+FAILURE / RETRY
+  "not a JWS/JWT (3 parts)" -> the value isn't a token (maybe it's URL-encoded or a
+  JWE with 5 parts — this tool handles signed JWS/JWT, not encrypted JWE). verify
+  INVALID just means wrong key/alg — try the other key type or the confusion attack.
+"""
+
+JS_RECON = """\
+Mine a website's JavaScript for endpoints, secrets, and interesting parameters.
+Fetches the page, pulls in its linked + inline scripts, and greps the JS for API
+paths, leaked credentials (API keys, tokens, private keys), and parameter names
+worth probing. LinkFinder + SecretFinder in one call. Read-only.
+
+WHEN TO USE
+  On any web target with a real front-end. Modern apps hide their whole API surface
+  in JS bundles — this pulls out the endpoints to test and any secrets baked into
+  the client. Run it after http_probe flags a live, interesting web host.
+
+INPUT
+  target: a page URL (its <script src> + inline scripts are discovered and fetched)
+  OR a direct .js URL (analyzed alone). only_secrets: report just the secrets.
+
+OUTPUT — sections:
+  "# js_recon: URL  (5 scripts, 34 endpoints, 2 secrets, 3 params)" summary line.
+  "## SECRETS" — "[type] value  (in app.js)". Types include aws-access-key,
+  google-api-key, github-token, stripe-secret, slack-token, jwt, private-key,
+  generic-secret, etc.
+  "## endpoints" — API paths and absolute URLs found (static assets filtered out).
+  "## interesting params" — names like token/auth/admin/redirect/is_admin.
+
+HOW TO INTERPRET
+  - SECRETS are the headline. A live key (AWS, Stripe, GitHub, Slack) is often
+    directly usable — but VERIFY: front-end keys are sometimes public/scoped by
+    design (e.g. a Google Maps browser key, a Stripe *publishable* pk_). A secret
+    key (sk_live, private-key, aws-secret) leaking client-side is a real finding.
+  - endpoints map the API surface: look for /admin, /api/internal, /debug, version
+    prefixes, and paths that take ids/params. These are your next targets.
+  - interesting params hint at features to fuzz (redirect= for open redirect/SSRF,
+    is_admin/role for authz, token/jwt for auth).
+
+WHAT TO DO NEXT
+  - Probe discovered endpoints (curl/ffuf) — especially unauthenticated admin/debug.
+  - Feed a discovered JWT into the jwt tool; feed secrets into the matching service
+    (aws sts get-caller-identity, etc.) to confirm validity — only if authorized.
+  - New hostnames in the endpoints feed back into subdomain recon.
+
+FAILURE / RETRY
+  0 scripts can mean a server-rendered site (scan the page HTML — it still does) or
+  a heavy SPA that injects scripts at runtime (point it at the bundle URL directly).
+  Secrets found here are REAL — handle carefully, never commit them.
+"""
+
 TLS_AUDIT = """\
 Audit a host's TLS configuration and HTTP security headers in one call. Reports
 the negotiated protocol/cipher, which TLS versions the server accepts (flagging
@@ -318,7 +420,7 @@ MODE 1 - DIGEST (call with just `file`, optionally `sections`)
               hash= and the hashcat mode in the note); Kerberos (kerberoast-spn =
               a roastable SPN; kerberoast/asrep-roast = a ready $krb5tgs$/$krb5asrep$
               hash when the ticket cipher was captured). SMB shares/files appear in
-              the "files" section ([smb-share] \\host\share).
+              the "files" section (e.g. [smb-share] for a UNC path).
   Narrow with sections (e.g. "creds,hosts,files") on large captures to save tokens.
 
   KEY LOOT TO ACT ON:

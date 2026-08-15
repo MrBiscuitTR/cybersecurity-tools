@@ -26,6 +26,8 @@ from recon import dns_records as _dns_records
 from recon import http_probe as _http_probe
 from recon import subdomains as _subdomains
 from recon import takeover as _takeover
+from web import js_recon as _js_recon
+from web import jwt_audit as _jwt
 from web import tls_audit as _tls_audit
 
 
@@ -85,6 +87,44 @@ def build_app():
         tool description for reading the AXFR result. Returns compact text."""
         res = _dns_records.run(domain, axfr=axfr)
         return "\n".join(_dns_records._compact_lines(res))
+
+    @app.tool(description=guides.JWT)
+    def jwt(action: str = "decode", token: str = "", secret: str = "",
+            key_pem: str = "", public_key_pem: str = "", alg: str = "",
+            payload: str = "", header: str = "{}", wordlist: str = "") -> str:
+        """Decode/verify/sign/crack/attack a JWT. Set `action` and pass only that
+        action's fields (see the tool description). Returns compact text."""
+        import json as _json
+        if action == "decode":
+            return "\n".join(_jwt._decode_lines(_jwt.analyze(token)))
+        if action == "verify":
+            r = _jwt.verify(token, secret or key_pem)
+            return f"verify: {'VALID' if r['valid'] else 'INVALID'}  alg={r['alg']}  ({r['reason']})"
+        if action == "sign":
+            return _jwt.sign(_json.loads(header or "{}"), _json.loads(payload),
+                             secret or key_pem, alg)
+        if action == "crack":
+            with open(wordlist, encoding="utf-8", errors="ignore") as fh:
+                s = _jwt.crack_hs(token, fh)
+            return f"crack: {'FOUND secret=' + s if s else 'not found'}"
+        if action == "attack":
+            words = open(wordlist, encoding="utf-8", errors="ignore") if wordlist else None
+            res = _jwt.attack(token, public_key=public_key_pem or None, words=words)
+            if words:
+                words.close()
+            out = []
+            for a in res["attacks"]:
+                tag = a.get("variant") or a.get("secret") or ""
+                out += [f"## {a['attack']} {tag}".rstrip(), a["token"], f"   note: {a['note']}"]
+            return "\n".join(out)
+        return f"unknown action {action!r}; use decode|verify|sign|crack|attack"
+
+    @app.tool(description=guides.JS_RECON)
+    def js_recon(target: str, only_secrets: bool = False) -> str:
+        """Mine a site's JavaScript for endpoints, secrets, and params. See the
+        tool description for how to read/verify secrets. Returns compact text."""
+        res = _js_recon.run(target)
+        return "\n".join(_js_recon._compact_lines(res, only_secrets))
 
     @app.tool(description=guides.TLS_AUDIT)
     def tls_audit(target: str, version_probe: bool = True) -> str:
