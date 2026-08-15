@@ -32,6 +32,13 @@ Doesn't fit: raw socket/port work (see [../network](../network)).
   python -m web.js_recon https://example.com/static/app.js --only-secrets --json
   ```
 
+- **[dirfuzz.py](dirfuzz.py)** — content discovery (dir/file brute force) with
+  **soft-404 auto-calibration** so hits are real. Built-in wordlist or `--wordlist`.
+- **[ssrf.py](ssrf.py)** — SSRF probe (cloud-metadata/file/internal payloads +
+  baseline diff + optional out-of-band `--callback` for blind SSRF).
+- **[smuggle.py](smuggle.py)** — HTTP request-smuggling (CL.TE/TE.CL) detector via
+  the safe timing method (raw sockets; detection only).
+
 - **[jwt_audit.py](jwt_audit.py)** — decode, audit, verify, forge, and attack JWTs.
   Supports `none, HS256/384/512, RS256/384/512, PS256/384/512, ES256/384/512, EdDSA`
   (built on `cryptography` + stdlib, no PyJWT). Auto-attacks: `alg=none`, RS→HS

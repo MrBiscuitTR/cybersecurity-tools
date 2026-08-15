@@ -740,6 +740,110 @@ URL. 0 leads on a real codebase is unusual — try without a class filter, or au
 directly.
 """
 
+NUCLEI = """\
+Run nuclei (template-based vuln scanner) and return compact, de-duplicated, severity-
+ranked findings. nuclei has thousands of checks (CVEs, misconfigs, exposures, default
+creds); this wraps it and strips the noise so you get the signal. Requires nuclei +
+its templates on the host. Active scanner — authorized targets only.
+
+WHEN TO USE: after http_probe/playbook flags a live web host worth scanning. Scope with
+severity/tags to keep it fast and relevant.
+INPUT: target (URL/host). severity ("critical,high"), tags ("cve,exposure,misconfig,
+default-login"), templates (a specific path). Scanning takes time; it's not instant.
+OUTPUT: "# nuclei: target (N findings)", counts by severity, then per finding:
+"[SEVERITY] name (template-id)", where it matched, and a description.
+INTERPRET/NEXT: work critical/high first — each names a template you can look up for the
+exact check/PoC. Confirm before reporting (nuclei has occasional FPs). info-level is
+recon (tech/TLS). Feed confirmed CVEs into exploitation (with permission).
+FAILURE: "no templates provided" -> run `nuclei -update-templates` once. 0 findings with
+a tight tag filter is normal — broaden tags/severity.
+"""
+
+DIRFUZZ = """\
+Content discovery (directory/file brute force) with soft-404 auto-calibration. Finds
+hidden paths/files; crucially it learns the app's "not found" signature from random
+paths first and filters it, so the hits are REAL (not soft-404 noise). Ships a compact
+high-signal wordlist; point --wordlist at a big list (SecLists on the box) for depth.
+
+WHEN TO USE: on any web target, to map its hidden surface (admin panels, backups, .git,
+.env, api docs, config files). A core recon step.
+INPUT: base (URL). wordlist (path; else built-in). ext ("php,txt,bak" to append).
+OUTPUT: "# dirfuzz: base (N tested, M found)" then "[!] STATUS  SIZE  /path -> location".
+[!] marks 200/401/403 and dotfiles (the interesting ones).
+INTERPRET/NEXT: 200 = exists (open it); 401/403 = exists but gated (try bypasses/creds);
+301/302 = a real dir (recurse into it). Dotfiles (.git/.env) are jackpots — .git/config
+enables source recovery, .env leaks secrets. Feed found endpoints into js_recon/nuclei.
+FAILURE: "nothing found beyond baseline" -> try a bigger --wordlist or extensions. If
+EVERYTHING matches, the site is a hard SPA/soft-404 the calibration couldn't pin — inspect manually.
+"""
+
+SSRF = """\
+Probe a request parameter for SSRF (server-side request forgery). Injects internal-host,
+cloud-metadata, and file:// payloads into a chosen parameter and detects leaked metadata/
+file content, internal-service reachability (response differs from baseline), and — with
+a callback — BLIND SSRF (the server connects back). SSRF often means cloud takeover, so
+this is high value. Active; authorized targets only.
+
+WHEN TO USE: any parameter that makes the server fetch a URL/resource (url=, image=,
+webhook=, proxy=, callback=, feed=, path=). Mark the point with FUZZ or name it with param.
+INPUT: url (with FUZZ) or url + param. callback ("host:port" of a reachable listener for
+blind SSRF).
+OUTPUT: "VULNERABLE / no strong signal", baseline, then "## FINDINGS": [HIGH] payloads that
+leaked metadata/file content (with the evidence), [MEDIUM] internal hosts that changed the
+response. A BLIND SSRF callback hit is [HIGH].
+INTERPRET/NEXT: a metadata hit (169.254.169.254 -> AccessKeyId/iam) = grab the creds and go
+to iam_enum. file:///etc/passwd content = arbitrary file read. Internal-reachable (MEDIUM) =
+pivot to internal services (redis/6379, admin panels) via gopher/dict or more URLs. Confirm,
+then escalate with permission.
+FAILURE: no signal -> the param may not fetch, egress is filtered, or the response is
+identical (try --callback for blind, or different payloads/encodings).
+"""
+
+SMUGGLE = """\
+Detect HTTP request smuggling / desync (CL.TE and TE.CL) with the safe timing method. A
+front-end/back-end disagreement about request length lets an attacker poison other users'
+requests — a top-severity bug. This sends crafted requests that make the back-end HANG only
+if it parses length differently than the front-end; a large, consistent delay vs a fast
+baseline = a desync. DETECTION ONLY (self-timing; it does not smuggle into other users).
+
+WHEN TO USE: on sites behind a proxy/CDN/load-balancer (most non-trivial sites). Quick,
+low-noise check.
+INPUT: url. rounds (repeat each probe; default 2, higher = fewer false positives).
+OUTPUT: "DESYNC DETECTED / no desync detected", baseline latency, and per finding: which
+class (CL.TE / TE.CL / TE.CL(obf)) hung and by how much.
+INTERPRET/NEXT: a HIGH desync is a strong lead — but VERIFY manually (network jitter can
+cause a one-off delay; that's why it repeats). Then exploitation (crafting the smuggled
+prefix to poison the next request / steal it) is a careful, authorized manual step. Note the
+exact desync class — it dictates the exploit shape.
+FAILURE: "no desync" with a low baseline = the front/back agree (good). A HIGH baseline
+itself means the server is just slow — treat results with caution and raise --rounds.
+"""
+
+ORACLE = """\
+Crypto oracle tools: ECB detection and CBC padding-oracle decryption — the mechanical grind
+of crypto attacks, automated.
+  ecb-detect: given a ciphertext (hex/base64), find repeated 16-byte blocks = ECB mode
+    (leaks structure; enables cut-and-paste). Offline, instant.
+  padding: given a CBC ciphertext AND a padding oracle (any endpoint that reveals whether
+    decryption padding was valid), DECRYPT it fully without the key.
+
+WHEN TO USE: ecb-detect on any ciphertext you can see (cookies, tokens, params) to spot ECB.
+padding when an endpoint behaves differently for valid vs invalid padding (distinct error /
+status / length) — e.g. a decrypting cookie or a "token" parameter.
+INPUT: mode; data (the ciphertext, hex or base64). For padding: oracle (URL template with a
+CIPHER placeholder), encoding (how the ciphertext is placed in the URL: hex/base64/base64url/
+base64url-urlenc), and how to read "valid": invalid (regex that means INVALID) OR valid_status.
+OUTPUT: ecb-detect -> block stats + repeated blocks + "ECB LIKELY". padding -> the RECOVERED
+PLAINTEXT (and hex) plus the query count.
+INTERPRET/NEXT: ECB likely -> try byte-at-a-time ECB or block cut-and-paste. Padding success
+-> you decrypted attacker-visible ciphertext without the key; the same oracle can often be
+used to ENCRYPT arbitrary plaintext (forge a token) — a full auth bypass.
+FAILURE: "oracle gave no valid padding" -> your valid/invalid indicator is wrong. Send a
+known-good and known-bad ciphertext manually, see how the response differs (status/body/
+length), and set --invalid or --valid-status accordingly. Also confirm the encoding matches
+how the app expects the ciphertext.
+"""
+
 LOG_TRIAGE = """\
 Triage an auth or web-server log and surface attacks/anomalies. Parses SSH auth
 logs (sshd) and Apache/Nginx access logs (auto-detected per line) and returns a

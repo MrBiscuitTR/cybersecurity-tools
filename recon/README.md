@@ -65,6 +65,13 @@ transparency queries, email/username harvesting, metadata-based OSINT.
   python -m recon.favicon https://example.com
   ```
 
+- **[nuclei.py](nuclei.py)** — run nuclei (template vuln scanner) and return
+  de-duplicated, severity-ranked findings. Needs `nuclei` + templates on the box.
+
+  ```bash
+  python -m recon.nuclei https://target --severity critical,high
+  ```
+
 - **[secrets_scan.py](secrets_scan.py)** — scan a file/dir tree for leaked secrets
   (API keys, tokens, private keys) as `file:line`. Shares the ruleset with
   [../web/js_recon.py](../web/js_recon.py).

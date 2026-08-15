@@ -21,6 +21,7 @@ import sys
 
 from analyze import bughunt as _bughunt
 from analyze import exploit_advisor as _exploit_advisor
+from crypto import oracle as _oracle
 from cloud import iam_enum as _iam_enum
 from common import notes as _notes
 from common import safe_bash as _safe_bash
@@ -41,15 +42,19 @@ from recon import asn as _asn
 from recon import dns_records as _dns_records
 from recon import favicon as _favicon
 from recon import http_probe as _http_probe
+from recon import nuclei as _nuclei
 from recon import playbook as _playbook
 from recon import secrets_scan as _secrets_scan
 from recon import subdomains as _subdomains
 from recon import takeover as _takeover
 from web import cors as _cors
+from web import dirfuzz as _dirfuzz
 from web import graphql as _graphql
 from web import js_recon as _js_recon
 from web import jwt_audit as _jwt
 from web import oauth as _oauth
+from web import smuggle as _smuggle
+from web import ssrf as _ssrf
 from web import tls_audit as _tls_audit
 
 
@@ -147,6 +152,40 @@ def build_app():
         tool description for how to read/verify secrets. Returns compact text."""
         res = _js_recon.run(target)
         return "\n".join(_js_recon._compact_lines(res, only_secrets))
+
+    @app.tool(description=guides.NUCLEI)
+    def nuclei(target: str, severity: str = "", tags: str = "") -> str:
+        """Run nuclei and return ranked, de-duplicated findings. See the tool
+        description. Returns compact text."""
+        return "\n".join(_nuclei._compact_lines(_nuclei.run(target, severity=severity, tags=tags)))
+
+    @app.tool(description=guides.DIRFUZZ)
+    def dirfuzz(base: str, wordlist: str = "", ext: str = "") -> str:
+        """Content discovery with soft-404 filtering. See the tool description.
+        Returns compact text."""
+        exts = [e.strip() for e in ext.split(",") if e.strip()] if ext else []
+        return "\n".join(_dirfuzz._compact_lines(_dirfuzz.run(base, wordlist=wordlist, exts=exts)))
+
+    @app.tool(description=guides.SSRF)
+    def ssrf(url: str, param: str = "", callback: str = "") -> str:
+        """Probe a parameter for SSRF (mark with FUZZ or use param). See the tool
+        description. Returns compact text."""
+        return "\n".join(_ssrf._compact_lines(_ssrf.run(url, param=param, callback=callback)))
+
+    @app.tool(description=guides.SMUGGLE)
+    def smuggle(url: str, rounds: int = 2) -> str:
+        """Detect HTTP request smuggling (CL.TE/TE.CL) by timing. See the tool
+        description. Returns compact text."""
+        return "\n".join(_smuggle._compact_lines(_smuggle.run(url, rounds=rounds)))
+
+    @app.tool(description=guides.ORACLE)
+    def crypto_oracle(mode: str, data: str, oracle: str = "", encoding: str = "hex",
+                      invalid: str = "", valid_status: int = 0) -> str:
+        """ECB detection / CBC padding-oracle decryption. mode=ecb-detect|padding.
+        See the tool description. Returns compact text."""
+        res = _oracle.run(mode, data=data, oracle_url=oracle, encoding=encoding,
+                          invalid=invalid, valid_status=valid_status or None)
+        return "\n".join(_oracle._compact_lines(res))
 
     @app.tool(description=guides.GRAPHQL)
     def graphql(url: str) -> str:

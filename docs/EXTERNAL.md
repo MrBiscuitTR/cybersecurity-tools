@@ -49,6 +49,7 @@ request to the target host (`tls_audit`). DNS lookups still use the DoH resolver
 | `angr` (pip) | `reversing/symbolic.py` | `pip install angr` | Symbolic-execution solver. Heavy; runs the target in its own emulator. |
 | `ripgrep` (rg) | `analyze/bughunt.py`, ad-hoc via `common/safe_bash.py` | `apt install ripgrep` | Fast code search for the vuln sweep. |
 | `git` | `analyze/bughunt.py` (clone), `common/safe_bash.py` | preinstalled | Shallow-clones target repos. |
+| `nuclei` | `recon/nuclei.py` | `apt install nuclei` | Template scanner; run `nuclei -update-templates` once. |
 
 Planned tools will additionally wrap common Kali/RE tooling already on the box:
 `strings`, `xxd`/`hexdump`, `strace`, `ltrace`, `file`, `grep`, `tmux`. Each is
