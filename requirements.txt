@@ -14,7 +14,8 @@ capstone>=5.0         # reversing/disasm.py --raw and reversing/gadgets.py (ROP 
 # boto3>=1.34         # cloud/iam_enum.py — only needed to enumerate AWS credentials
 
 # MCP server — exposes these tools to the LLM operator (mcp_server/).
-mcp>=1.0
+# NOTE: pin <2 — an unrelated `mcp` 2.0.0 on PyPI lacks fastmcp. (Or use `fastmcp`.)
+mcp>=1.0,<2
 
 # Development
 pytest>=8.3

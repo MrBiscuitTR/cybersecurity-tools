@@ -59,21 +59,42 @@ from web import tls_audit as _tls_audit
 
 
 def _require_mcp():
+    # Accept either the official MCP SDK (mcp<2, provides mcp.server.fastmcp) or the
+    # standalone FastMCP 2.x package. NOTE: an unrelated `mcp` 2.0.0 on PyPI has NO
+    # fastmcp — install the SDK with `pip install 'mcp<2'` (or `pip install fastmcp`).
     try:
         from mcp.server.fastmcp import FastMCP
-    except ImportError:  # pragma: no cover - env without the SDK
+        return FastMCP
+    except ImportError:
+        pass
+    try:
+        from fastmcp import FastMCP
+        return FastMCP
+    except ImportError:  # pragma: no cover - env without either SDK
         sys.stderr.write(
-            "The 'mcp' package is not installed. Run: pip install mcp\n"
-            "(The tools themselves work standalone via `python -m <category>.<tool>`.)\n"
+            "No MCP SDK found. Install one:\n"
+            "  pip install 'mcp<2'      # official SDK (mcp.server.fastmcp)\n"
+            "  pip install fastmcp      # standalone FastMCP 2.x\n"
+            "(The tools also work standalone via `python -m <category>.<tool>`.)\n"
         )
         raise SystemExit(1)
-    return FastMCP
 
 
-def build_app():
-    """Construct and return the FastMCP app with all tools registered."""
+def build_app(host: str = "127.0.0.1", port: int = 8091, path: str = "/mcp"):
+    """Construct and return the FastMCP app with all tools registered.
+
+    host/port/path only matter for the HTTP transport; stdio ignores them.
+    """
     FastMCP = _require_mcp()
-    app = FastMCP("cybersecurity-tools")
+    try:
+        app = FastMCP("cybersecurity-tools", host=host, port=port, streamable_http_path=path)
+    except TypeError:  # older/standalone FastMCP: set via settings after construction
+        app = FastMCP("cybersecurity-tools")
+        for attr, val in (("host", host), ("port", port), ("streamable_http_path", path)):
+            try:
+                setattr(app.settings, attr, val)
+            except Exception:
+                pass
 
     @app.tool(description=guides.SUBDOMAINS)
     def enum_subdomains(domain: str, resolve: bool = False) -> str:
@@ -373,9 +394,27 @@ def build_app():
     return app
 
 
-def main() -> int:
-    app = build_app()
-    app.run()  # stdio transport
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="mcp_server.server", description="Run the cybersecurity-tools MCP server.")
+    p.add_argument("--transport", choices=("stdio", "http"), default="stdio",
+                   help="stdio (default, for local MCP clients) or http (network endpoint).")
+    p.add_argument("--host", default="0.0.0.0", help="HTTP bind host (default 0.0.0.0).")
+    p.add_argument("--port", type=int, default=8091, help="HTTP port (default 8091).")
+    p.add_argument("--path", default="/mcp", help="HTTP endpoint path (default /mcp).")
+    args = p.parse_args(argv)
+
+    app = build_app(host=args.host, port=args.port, path=args.path)
+    if args.transport == "http":
+        sys.stderr.write(f"[*] MCP over HTTP at http://{args.host}:{args.port}{args.path}\n")
+        # Prefer streamable-http; fall back to SSE on older SDKs.
+        try:
+            app.run(transport="streamable-http")
+        except (ValueError, TypeError):
+            app.run(transport="sse")
+    else:
+        app.run()  # stdio
     return 0
 
 

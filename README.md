@@ -81,10 +81,40 @@ compact, context-window-friendly output, with a **teaching-style description per
 tool** (see [mcp_server/guides.py](mcp_server/guides.py)) so a smaller model
 knows how to read the output, what to do next, and when to retry.
 
+### Setup (use a venv — keep it clean)
+
 ```bash
-pip install mcp
-python -m mcp_server.server        # stdio transport; point your MCP client here
+python -m venv .venv
+source .venv/bin/activate                 # Windows: .venv\Scripts\activate
+pip install 'mcp<2' cryptography pefile capstone
+# optional, only for specific tools:
+#   pip install angr      # reversing/symbolic
+#   pip install boto3     # cloud/iam_enum
 ```
+
+> **`mcp<2` matters:** an unrelated `mcp` 2.0.0 on PyPI has no `fastmcp` and will
+> fail to start. Pin `<2` (or `pip install fastmcp` — the server accepts either).
+
+### Run
+
+```bash
+# stdio (default) — the client launches this and talks over stdin/stdout:
+python -m mcp_server.server
+
+# HTTP endpoint — reachable over the network at http://<host>:<port>/mcp:
+python -m mcp_server.server --transport http --host 0.0.0.0 --port 8091
+```
+
+Point your MCP client at the stdio command, or the HTTP URL. Example stdio config:
+
+```json
+{ "mcpServers": { "cybersec": {
+    "command": "python", "args": ["-m", "mcp_server.server"], "cwd": "/path/to/repo" } } }
+```
+
+The wrapper tools shell out to CLI tools that must be present on the host (Kali):
+`nuclei`, `ffuf`, `binwalk`, `ghidra`/`analyzeHeadless`, `objdump`, `tshark`,
+`ripgrep`, `git`. See [docs/EXTERNAL.md](docs/EXTERNAL.md).
 
 ## Setup
 
