@@ -49,6 +49,7 @@ Every tool obeys these (full detail in [docs/CONVENTIONS.md](docs/CONVENTIONS.md
 | [passwords/](passwords/) | Credential *analysis* | strength/entropy scoring (no cracker clones) |
 | [forensics/](forensics/) | Artifacts & captures | metadata/log parsing, pcap readers for AI consumption |
 | [malware/](malware/) | Static triage only | PE/ELF headers, strings, imports, IOC extraction |
+| [reversing/](reversing/) | Reverse engineering | Ghidra-headless decompilation to pseudo-C |
 | [common/](common/) | Shared helpers | HTTP (stdlib), JSON/compact output, validators, subprocess capture |
 | [mcp_server/](mcp_server/) | MCP server for the LLM operator | exposes tools + teaching-style usage guides |
 | [data/](data/) | Tiny fixtures only | (big lists live on the Kali box, passed by path) |

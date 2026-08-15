@@ -23,6 +23,9 @@ from forensics import log_triage as _log_triage
 from forensics import pcap as _pcap
 from malware import triage as _triage
 from mcp_server import guides
+from reversing import decompile as _decompile
+from reversing import disasm as _disasm
+from reversing import firmware as _firmware
 from recon import asn as _asn
 from recon import dns_records as _dns_records
 from recon import favicon as _favicon
@@ -154,6 +157,33 @@ def build_app():
         """Scan a file/dir for leaked secrets (API keys, tokens, private keys) as
         file:line. Findings are REAL secrets — handle carefully. Compact text."""
         return "\n".join(_secrets_scan._compact_lines(_secrets_scan.run(path, max_size=max_size)))
+
+    @app.tool(description=guides.DECOMPILE)
+    def decompile(binary: str, function: str = "", all: bool = False) -> str:
+        """Decompile a binary to pseudo-C via Ghidra headless. Default lists the
+        function map; set `function` (name/address) or all=true. See the tool
+        description for interpreting stripped/packed binaries. Returns compact text."""
+        mode = "func" if function else "all" if all else "list"
+        res = _decompile.run(binary, mode=mode, target=function)
+        return "\n".join(_decompile._compact_lines(res))
+
+    @app.tool(description=guides.DISASM)
+    def disasm(file: str, function: str = "", all: bool = False, syntax: str = "intel",
+               raw: bool = False, arch: str = "x86-64", base: int = 0x1000,
+               offset: int = 0) -> str:
+        """Disassemble a binary (objdump) or raw blob (capstone, raw=true). See the
+        tool description for modes and raw-arch selection. Returns compact text."""
+        mode = "func" if function else "all" if all else "list"
+        res = _disasm.run(file, mode=mode, target=function, syntax=syntax,
+                          raw=raw, arch=arch, base=base, offset=offset)
+        return "\n".join(_disasm._compact_lines(res))
+
+    @app.tool(description=guides.FIRMWARE)
+    def firmware(file: str, extract: bool = False, recursive: bool = False) -> str:
+        """Scan/unpack firmware with binwalk and triage the contents (creds, keys,
+        configs, binaries, hardcoded secrets). See the tool description. Compact text."""
+        res = _firmware.run(file, extract=extract, recursive=recursive)
+        return "\n".join(_firmware._compact_lines(res))
 
     @app.tool(description=guides.LOG_TRIAGE)
     def log_triage(file: str, top: int = 15) -> str:

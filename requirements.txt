@@ -7,8 +7,9 @@
 # (no `dnspython`) — deliberately, to keep the runtime dependency-free.
 
 # Needed by specific tools (documented at the top of each tool that imports it):
-cryptography>=44.0    # web/tls_audit.py cert parsing; crypto/ helpers
+cryptography>=44.0    # web/tls_audit.py cert parsing; web/jwt_audit.py RS/ES/EdDSA
 pefile>=2024.8.26     # malware/triage.py deep PE analysis (optional; generic report works without it)
+capstone>=5.0         # reversing/disasm.py --raw blob disassembly (optional; objdump path needs nothing)
 
 # MCP server — exposes these tools to the LLM operator (mcp_server/).
 mcp>=1.0

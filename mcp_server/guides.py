@@ -189,6 +189,137 @@ FAILURE / RETRY
   to resolve and have findable subdomains.
 """
 
+DECOMPILE = """\
+Decompile a binary to PSEUDO-C using Ghidra headless — the readable form for
+reasoning about a program's logic, even when it's stripped, optimized, or obfuscated.
+Runs Ghidra's full analysis + decompiler from the command line (no GUI). Requires
+Ghidra on the host (analyzeHeadless); meant to run where Ghidra lives (the Kali box).
+
+WHEN TO USE
+  You have an executable (ELF/PE) and want to understand what it does: a CTF binary,
+  a malware sample (unpack it first — see below), a crackme, an unknown service
+  binary. You (the model) read pseudo-C far better than raw assembly — use this.
+
+MODES / INPUT
+  Default (mode="list"): a MAP of the binary — imports, the function table
+    (name @ address size), and defined strings. START HERE: it's small and lets you
+    pick a target without dumping everything.
+  function="NAME": decompile the function(s) whose name OR entry address matches.
+    Exact name match wins (so "main" won't also grab "__libc_start_main"); otherwise
+    substring (so "crypt" matches "encrypt_buf"). For stripped binaries use the
+    Ghidra auto-name (FUN_00101149) or the raw address (001011a0) from the list.
+  all=true: decompile EVERY function — can be large, mind the context window; prefer
+    listing then decompiling targeted functions.
+
+OUTPUT
+  list: "## imports (...)", "## functions (...)" as "name @ addr size=N", "## strings".
+  function/all: "## <name> @ <addr>" then the decompiled C for each.
+
+HOW TO INTERPRET — the intuition:
+  - Ghidra names locals generically (iVar1, local_10, param_1). Read for structure:
+    string compares (strcmp/memcmp against a constant = a password/key check), magic
+    constants, loops that xor/add (encoding/crypto), size checks, and calls to
+    system/exec/network APIs. builtin_strncpy(local,"hunter2",8) literally shows an
+    embedded secret.
+  - Stripped binary: real logic hides in FUN_* functions; find the one called from
+    entry/__libc_start_main and follow the call tree.
+  - If the function list is tiny and strings show "UPX"/high entropy (check with the
+    triage tool), the binary is PACKED — decompiling now yields only the unpacking
+    stub. Unpack first (`upx -d`, or run in a sandbox and dump), then re-decompile.
+  - undefined/undefined8 return types mean Ghidra couldn't infer them — not an error.
+
+WHAT TO DO NEXT
+  - From the function map, decompile main and any interestingly-named/sized function.
+  - Cross-check a specific routine against its disassembly if the C looks wrong
+    (the disasm tool / objdump -d on the box).
+  - Feed a decompiled function to the local model to explain/patch/find the bug.
+
+FAILURE / RETRY
+  "analyzeHeadless not found" -> install Ghidra (Kali: apt install ghidra) or set
+  GHIDRA_HEADLESS. First run on a binary is slow (JVM + full analysis, tens of
+  seconds to minutes) — that's normal, not a hang. Empty function list usually means
+  a packed/encrypted or non-code file.
+"""
+
+DISASM = """\
+Disassemble a binary to annotated assembly — per function (via objdump) or a raw
+byte blob (via capstone). Use it when pseudo-C isn't enough: to see exact
+instructions, a specific gadget, anti-debug/syscall setup, or to read shellcode /
+an extracted code region that isn't a full binary. Read-only.
+
+WHEN TO USE
+  Alongside decompile: decompile gives the logic in C; disasm gives the ground-truth
+  instructions. Reach for it when the pseudo-C looks wrong, you need exact bytes/
+  offsets, or you have a flat blob (shellcode, a carved code section) with no ELF header.
+
+MODES / INPUT
+  Default (mode="list"): function table (name @ address, instruction count).
+  function="NAME": disassemble matching function(s) (exact name/address first, then
+    substring). Use the name or address from the list.
+  all=true: every function.
+  raw=true + arch: treat the file as raw machine code. arch one of x86-64, x86, arm,
+    thumb, arm64, mips, mipsel. base sets the start address; offset skips leading bytes.
+
+OUTPUT
+  list: "name @ address  (N insns)".
+  function/all/raw: "## name @ addr" then "  <addr>:  <instruction>" lines.
+
+HOW TO INTERPRET
+  - Immediate/movabs constants often ARE the data: "movabs rax,0x327265746e7568" is
+    the ASCII "hunter2" little-endian — decode hex immediates to bytes.
+  - call <fn@plt> shows library calls (strcmp/memcmp/system/...). cmp/test + a
+    conditional jump is a check; a xor/add loop is encoding/crypto.
+  - For --raw, pick the arch from the firmware/target (mips/arm are common in IoT);
+    if output is garbage, the arch/endianness or base/offset is wrong — try another.
+
+WHAT TO DO NEXT
+  - Correlate with decompile's pseudo-C for the same function.
+  - For gadget hunting or exploit dev, grep the output for ret/jmp/pop sequences.
+
+FAILURE / RETRY
+  "objdump not found" -> install binutils. "capstone not installed" -> pip install
+  capstone (only needed for --raw). Garbled --raw output = wrong arch/endianness.
+"""
+
+FIRMWARE = """\
+Analyze and unpack firmware images with binwalk, then TRIAGE what comes out. Given a
+router/IoT .bin (or any blob), it lists embedded signatures and — with extract — carves
+out the filesystems (SquashFS/JFFS2/CramFS/...) and hands you the loot: config files,
+credentials, keys/certs, and the embedded binaries to reverse next. Read-only on input.
+
+WHEN TO USE
+  Any firmware image or unknown blob that might contain a filesystem or nested files.
+  This is the entry point for IoT/router assessment: unpack, find creds/keys, then
+  decompile/triage the binaries inside.
+
+INPUT
+  file: the firmware image. extract=true to carve + triage (not just scan).
+  recursive=true adds matryoshka (recurse into extracted files — thorough but slower).
+
+OUTPUT
+  "## embedded signatures" — "offset  type" (SquashFS, gzip, uImage header, ...): what
+  the blob contains and where.
+  With extract: "## extracted -> <dir> (N files)" then categorized findings:
+    "### credentials" (etc/passwd, shadow, .htpasswd),
+    "### keys-certs" (id_rsa, *.pem, *.key, *.crt, authorized_keys),
+    "### config" (etc/*, *.conf/cfg/ini/xml), "### scripts" (rcS, init, *.sh),
+    "### binaries (...) — decompile/triage these", and
+    "### HARDCODED SECRETS" (grep hits like password=... inside the extracted files).
+
+HOW TO INTERPRET / NEXT
+  - credentials + HARDCODED SECRETS are the immediate win: /etc/passwd hashes to crack,
+    admin passwords in configs, private keys for the device/services.
+  - The listed binaries (busybox, service daemons) are your reverse-engineering targets
+    — feed each to the decompile / triage / disasm tools.
+  - No signatures found can mean the firmware is encrypted (check entropy with the
+    triage tool) or uses an unknown/monolithic format — you may need the vendor's format.
+
+FAILURE / RETRY
+  "binwalk not found" -> apt install binwalk (+ extractors: squashfs-tools, jefferson,
+  ubi_reader). Extraction needs the right extractor for the filesystem type; a listed
+  signature that didn't extract usually means a missing extractor utility.
+"""
+
 LOG_TRIAGE = """\
 Triage an auth or web-server log and surface attacks/anomalies. Parses SSH auth
 logs (sshd) and Apache/Nginx access logs (auto-detected per line) and returns a

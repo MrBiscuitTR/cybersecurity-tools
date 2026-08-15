@@ -50,9 +50,10 @@ _SECRET_PATTERNS = [
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
     ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")),
     ("firebase-url", re.compile(r"https://[a-z0-9-]+\.firebaseio\.com")),
+    # Matches quoted ("api_key": "…") AND unquoted (admin_password=… in configs).
     ("generic-secret", re.compile(
-        r"""(?i)(?:api[_-]?key|secret|passwd|password|auth[_-]?token|access[_-]?token|"""
-        r"""client[_-]?secret|bearer)['"]?\s*[:=]\s*['"]([^'"\s]{8,60})['"]""")),
+        r"""(?i)(?:api[_-]?key|secret|passwd|password|passphrase|auth[_-]?token|"""
+        r"""access[_-]?token|client[_-]?secret|bearer)['"]?\s*[:=]\s*['"]?([^'"\s]{6,60})""")),
 ]
 
 # --- endpoint/path extraction (LinkFinder-style, simplified but robust) ------
