@@ -628,6 +628,118 @@ FAILURE: few live hosts can mean heavy CDN/WAF or a small footprint; run the ind
 different options. Large domains take a while (enumerates then probes every host).
 """
 
+SAFE_BASH = """\
+Run a shell command on the box, gated by a host-safety policy. This is your general
+shell for recon/analysis — rg, grep, find, cat/head/tail, ls, file, stat, awk, sed
+(non -i), git (clone/log/show/diff/grep), curl/wget, xxd/strings/objdump/nm/readelf,
+python3, and pipes/&&/;/subshells between them. Output is captured and capped for your
+context.
+
+WHEN TO USE: constantly — it's how you follow definitions, trace calls, view code
+around a line (sed -n '30,60p' file), search a codebase (rg -n 'pattern'), inspect
+files, and drive other CLI tools. It is the backbone of manual investigation.
+
+INPUT: command (a normal shell command line). cwd (run inside a repo/dir). timeout.
+
+OUTPUT: "$ <cmd> (exit=N)" then stdout, then stderr if any. Large output is TRUNCATED
+(head+tail with an "N lines omitted" marker) — narrow the command (add filters, head,
+--max-count, a tighter path) rather than dumping everything.
+
+SAFETY POLICY (important): destructive/host-changing commands are BLOCKED and NOT run —
+rm/rmdir/mv/dd/shred/truncate, chmod/chown, mkfs/mount, sudo/su, kill/systemctl/reboot,
+user/cron changes, package installs (apt/pip/npm/...), git history mutation (push/reset
+--hard/clean), sed -i, pipe-download-to-shell (curl|sh), and redirects overwriting
+device/system files. If you see "BLOCKED — ...", DON'T try to bypass it (no base64/
+obfuscation) — rewrite the command to be read-only, or ask the user to do the destructive
+step. Reading, searching, and analyzing are all allowed; you never need to delete or
+modify host files to do your job.
+
+WHAT TO DO NEXT: chain shell steps to investigate — e.g. `rg -n 'def login' -> sed -n`
+to read the function -> `rg -n 'login\\('` to find callers. Record anything important
+with the notes tool.
+
+FAILURE: "BLOCKED" = policy; rewrite read-only. Non-zero exit = the command itself
+failed (check stderr). Truncated = narrow the query.
+"""
+
+NOTES = """\
+Persistent scratch notebook so findings survive context compaction. On any non-trivial
+engagement your context WILL get summarized/truncated — anything not written down is
+lost. Use this to record state as you go and to recover it afterward.
+
+ACTIONS (set `action`):
+  append  add a note (a finding, credential, host, decision, next step). Pass `content`.
+  read    dump the whole notes file back — do this after a compaction to recover state.
+  clear   start fresh (rarely needed).
+  `file` optionally points at a specific notes file (e.g. inside the target repo).
+
+WHEN TO USE — a discipline, not an afterthought:
+  - append IMMEDIATELY when you find or suspect something: what, where (file:line / URL),
+    the evidence, severity, and how it might chain with other findings.
+  - append the primitives you hold (creds, tokens, readable paths, leaked values) and
+    open questions / next steps.
+  - read at the start of a resumed session or after you notice context was compacted.
+  Keep entries brief but self-contained — understandable with zero surrounding context.
+
+OUTPUT: append -> a confirmation; read -> the full notes text.
+NEXT: turn accumulated notes into a writeup when reporting (title/severity/component/
+repro/impact/fix per finding). See the methodology guidance for how to think and report.
+"""
+
+BUGHUNT = """\
+Hunt for vulnerabilities in a source-code repository (bug-bounty / code-audit aide).
+Clones (or opens) a codebase and sweeps ~60 vulnerability signatures across languages —
+memory-unsafe C, command injection, SQLi, XSS, SSRF, path traversal, insecure
+deserialization, SSTI, XXE, weak crypto, hardcoded secrets, JWT misuse, TOCTOU, open
+redirect, prototype pollution, IDOR hints, backdoors, and more — ranks the hits, and
+writes them to a scratch notes file. ONLY run this when the user explicitly asks to hunt
+bugs in a repo. Read-only (clones + greps; never builds or runs the code).
+
+WHEN TO USE: the user points you at a repo (URL or path) to audit for bugs. It gives you
+a fast MAP of where to look; the actual finding of bugs is your job, steered below.
+
+INPUT: target (repo URL — cloned shallow — or a local path). classes (optional subset,
+e.g. "sqli,ssrf,command-injection"). It writes BUGHUNT_NOTES.md into the repo.
+
+OUTPUT: counts by severity/class, the notes-file path, and the HIGH/MEDIUM leads as
+"[class] file:line  snippet". Each lead is a STARTING POINT, not a confirmed bug.
+
+HOW TO ACTUALLY FIND BUGS (this is the point — think like an attacker):
+  1. A match is a LEAD. Open the code around it (safe_bash: sed -n 'L1,L2p' file, or
+     rg for the symbol) and understand what it does.
+  2. FOLLOW THE DATA. A bug is untrusted input reaching a dangerous sink. For each lead,
+     trace SOURCE (where input enters: HTTP param, filename, body, env) -> PATH (funcs,
+     transforms, checks) -> SINK (query/command/buffer/path/URL). Use safe_bash to grep
+     for the variable and follow it across files/functions.
+  3. Confirm the PRECONDITION (auth needed? a specific state?) and the IMPACT (RCE, data
+     read, account takeover). If you can't connect source to sink, it's not confirmed —
+     dig deeper or drop it.
+  4. CHAIN findings. A leaked path -> a config -> a key -> an API. A predictable id +
+     missing auth check = IDOR/takeover. Always ask "what does this ENABLE?" Bigger,
+     chained vulns beat a pile of low-severity noise — keep the focus on impact.
+  5. Understand the BUSINESS LOGIC and trust boundaries — cross a line the developer
+     assumed no one would. Question defaults, debug flags, TODOs, commented-out checks.
+  6. NOTE EVERYTHING as you go with the notes tool (or append to BUGHUNT_NOTES.md):
+     confirmed bugs AND interesting leads, briefly but completely, so they survive
+     context compaction. Re-read your notes after any compaction.
+  7. The automated sweep is not exhaustive. Also dive into interesting files directly and
+     read entry points/handlers — but that's slower and heavier on context, so let the
+     leads focus you first.
+
+  Prioritize by class: command-injection / insecure-deserialization / sqli / command-exec
+  / ssrf are usually the fastest paths to high impact; memory-unsafe matters most in
+  C/C++ services; hardcoded-secret can be an instant win. idor-authz/weak-crypto need
+  more context to turn into impact.
+
+DO NOT exploit or run intrusive tests without explicit user permission and authorization.
+Enumerate and PROVE safely first (describe the exact malicious input), then ask before
+pulling the trigger.
+
+FAILURE: "ripgrep not found" -> apt install ripgrep. "git clone failed" -> bad/private
+URL. 0 leads on a real codebase is unusual — try without a class filter, or audit files
+directly.
+"""
+
 LOG_TRIAGE = """\
 Triage an auth or web-server log and surface attacks/anomalies. Parses SSH auth
 logs (sshd) and Apache/Nginx access logs (auto-detected per line) and returns a

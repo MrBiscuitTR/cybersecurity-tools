@@ -13,3 +13,16 @@ Higher-altitude tools that synthesize other tools' output into decisions — the
   ```bash
   python -m analyze.exploit_advisor ./vuln
   ```
+
+- **[bughunt.py](bughunt.py)** — source-code vulnerability sweep (bug-bounty aide).
+  Clones/opens a repo and greps ~60 vuln signatures across languages (command
+  injection, SQLi, XSS, SSRF, deserialization, memory-unsafe C, hardcoded secrets,
+  …), ranks the leads, and writes them to a scratch notes file. The **methodology
+  for turning leads into confirmed bugs** lives in the MCP guide and
+  [../docs/METHODOLOGY.md](../docs/METHODOLOGY.md). Needs `ripgrep`. Run only when
+  asked to hunt bugs.
+
+  ```bash
+  python -m analyze.bughunt https://github.com/org/repo
+  python -m analyze.bughunt ./repo --classes sqli,ssrf
+  ```

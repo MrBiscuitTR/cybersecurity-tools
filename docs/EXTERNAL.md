@@ -47,6 +47,8 @@ request to the target host (`tls_audit`). DNS lookups still use the DoH resolver
 | `objdump` (binutils) | `reversing/disasm.py` | preinstalled | Per-function disassembly. |
 | `binwalk` (+ extractors) | `reversing/firmware.py` | `apt install binwalk squashfs-tools jefferson` | Firmware scan/extract. Extraction needs the extractor for each filesystem type. |
 | `angr` (pip) | `reversing/symbolic.py` | `pip install angr` | Symbolic-execution solver. Heavy; runs the target in its own emulator. |
+| `ripgrep` (rg) | `analyze/bughunt.py`, ad-hoc via `common/safe_bash.py` | `apt install ripgrep` | Fast code search for the vuln sweep. |
+| `git` | `analyze/bughunt.py` (clone), `common/safe_bash.py` | preinstalled | Shallow-clones target repos. |
 
 Planned tools will additionally wrap common Kali/RE tooling already on the box:
 `strings`, `xxd`/`hexdump`, `strace`, `ltrace`, `file`, `grep`, `tmux`. Each is

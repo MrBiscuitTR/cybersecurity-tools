@@ -19,8 +19,11 @@ from __future__ import annotations
 
 import sys
 
+from analyze import bughunt as _bughunt
 from analyze import exploit_advisor as _exploit_advisor
 from cloud import iam_enum as _iam_enum
+from common import notes as _notes
+from common import safe_bash as _safe_bash
 from cloud import s3_hunt as _s3_hunt
 from forensics import log_triage as _log_triage
 from forensics import pcap as _pcap
@@ -177,6 +180,27 @@ def build_app():
         """Generate a YARA rule from a sample for threat hunting. See the tool
         description. Returns compact text (the rule)."""
         return "\n".join(_yara_gen._compact_lines(_yara_gen.run(file, name=name)))
+
+    @app.tool(description=guides.SAFE_BASH)
+    def bash(command: str, cwd: str = "", timeout: float = 60.0) -> str:
+        """Run a shell command through the host-safety policy (destructive commands are
+        blocked, never executed). See the tool description for what's allowed. Compact text."""
+        res = _safe_bash.run(command, cwd=cwd or None, timeout=timeout)
+        return "\n".join(_safe_bash._compact_lines(res))
+
+    @app.tool(description=guides.NOTES)
+    def notes(action: str = "read", content: str = "", file: str = _notes.DEFAULT_FILE) -> str:
+        """Persistent scratch notes (append/read/clear) that survive compaction. See the
+        tool description — take notes constantly. Returns compact text."""
+        return "\n".join(_notes._compact_lines(_notes.run(action, content=content, file=file)))
+
+    @app.tool(description=guides.BUGHUNT)
+    def bughunt(target: str, classes: str = "") -> str:
+        """Sweep a repo (URL or path) for vulnerability patterns; writes a notes file.
+        ONLY when the user asks to hunt bugs. See the tool description for the hacker
+        methodology to turn leads into confirmed bugs. Returns compact text."""
+        cl = [c.strip() for c in classes.split(",")] if classes else None
+        return "\n".join(_bughunt._compact_lines(_bughunt.run(target, classes=cl)))
 
     @app.tool(description=guides.EXPLOIT_ADVISOR)
     def exploit_advisor(file: str) -> str:
