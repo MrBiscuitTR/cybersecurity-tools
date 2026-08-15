@@ -1,0 +1,17 @@
+# Minimal dependencies. Standard library first; each entry below must earn its
+# place. Refresh with `pip list --outdated`. The recon/DNS tools use only the
+# stdlib (urllib + a hand-rolled DoH client), and many tools wrap Kali binaries
+# via subprocess, so they need nothing here.
+#
+# NOTE: HTTP is stdlib urllib (no `requests`) and DNS is stdlib wireformat DoH
+# (no `dnspython`) — deliberately, to keep the runtime dependency-free.
+
+# Needed by specific tools (documented at the top of each tool that imports it):
+cryptography>=44.0    # web/tls_audit.py cert parsing; crypto/ helpers
+pefile>=2024.8.26     # malware/ static PE parsing (planned)
+
+# MCP server — exposes these tools to the LLM operator (mcp_server/).
+mcp>=1.0
+
+# Development
+pytest>=8.3
