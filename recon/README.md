@@ -37,3 +37,13 @@ transparency queries, email/username harvesting, metadata-based OSINT.
   python -m recon.dns_records example.com
   python -m recon.dns_records example.com --no-axfr --json
   ```
+
+- **[http_probe.py](http_probe.py)** — probe hosts over HTTP(S), one compact line
+  per live host: status, page title, server, redirect target, content length,
+  tech guess. The triage step after enumeration. Pass a host, a list
+  (`--hosts`/`--stdin`), or a domain with `--enum` to enumerate + probe in one go.
+
+  ```bash
+  python -m recon.http_probe example.com --enum
+  python -m recon.http_probe --hosts hosts.txt --json
+  ```

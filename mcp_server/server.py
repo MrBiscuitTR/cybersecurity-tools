@@ -20,8 +20,10 @@ from __future__ import annotations
 import sys
 
 from forensics import pcap as _pcap
+from malware import triage as _triage
 from mcp_server import guides
 from recon import dns_records as _dns_records
+from recon import http_probe as _http_probe
 from recon import subdomains as _subdomains
 from recon import takeover as _takeover
 from web import tls_audit as _tls_audit
@@ -60,6 +62,23 @@ def build_app():
         res = _takeover.run(domain or None, hosts=hosts or None, confirm=confirm)
         return "\n".join(_takeover._compact_lines(res))
 
+    @app.tool(description=guides.HTTP_PROBE)
+    def http_probe(target: str = "", hosts: list[str] | None = None,
+                   enum: bool = False, show_dead: bool = False) -> str:
+        """Probe hosts over HTTP(S); one line per live host. Set enum=true to
+        enumerate a domain's subdomains first. See the tool description for how to
+        read the output and prioritize. Returns compact text."""
+        targets = list(hosts or [])
+        if target:
+            if enum:
+                targets += _subdomains.run(target)["subdomains"] + [target]
+            else:
+                targets.append(target)
+        if not targets:
+            return "no targets provided"
+        res = _http_probe.run(targets)
+        return "\n".join(_http_probe._compact_lines(res, show_dead))
+
     @app.tool(description=guides.DNS_RECORDS)
     def dns_records(domain: str, axfr: bool = True) -> str:
         """Dump all DNS records for a domain and attempt a zone transfer. See the
@@ -73,6 +92,14 @@ def build_app():
         description for the FINDINGS ranking. Returns compact text."""
         res = _tls_audit.run(target, version_probe=version_probe)
         return "\n".join(_tls_audit._compact_lines(res))
+
+    @app.tool(description=guides.TRIAGE)
+    def triage_file(file: str, min_str: int = 4, max_strings: int = 200) -> str:
+        """Static triage of a file: hashes, entropy, strings/IOCs, PE/ELF internals,
+        ranked red flags. Never executes it. See the tool description for how to
+        read the flags. Returns compact text."""
+        res = _triage.run(file, min_str=min_str, max_strings=max_strings)
+        return "\n".join(_triage._compact_lines(res))
 
     @app.tool(description=guides.PCAP)
     def analyze_pcap(file: str, sections: str = "", stream: str = "",

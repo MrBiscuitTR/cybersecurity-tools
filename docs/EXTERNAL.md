@@ -53,8 +53,8 @@ documented at the top of the tool that uses it.
 | Package | Why | Used by |
 | --- | --- | --- |
 | `mcp` | MCP server exposing tools to the LLM | `mcp_server/` |
-| `cryptography` | crypto inspection helpers | `crypto/` (planned) |
-| `pefile` | static PE parsing | `malware/` (planned) |
+| `cryptography` | parse leaf certs (incl. invalid ones) | `web/tls_audit.py` |
+| `pefile` | deep PE analysis (optional) | `malware/triage.py` |
 | `pytest` | tests | `tests/` |
 
 **Not used on purpose:** HTTP is stdlib `urllib` (no `requests`); DNS is a stdlib

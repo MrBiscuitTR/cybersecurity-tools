@@ -142,6 +142,53 @@ WHAT TO DO NEXT
   - If AXFR is open, you likely have the full internal namespace — prioritize it.
 """
 
+HTTP_PROBE = """\
+Probe hosts over HTTP(S) and return one compact line per LIVE host: status, page
+title, server banner, redirect target, content length, and a technology guess.
+This is the triage step between "I have a big host list" and "these few are worth
+my time". Read-only GETs; no fuzzing, no payloads.
+
+WHEN TO USE
+  Right after subdomain enumeration. Pass a single host, an explicit list, or a
+  domain with enum=true to enumerate subdomains first and probe them all in one
+  shot. Run it before spending effort on any host — it tells you what's alive and
+  what it is.
+
+INPUT
+  target: a host to probe, OR a domain when enum=true (enumerate then probe all).
+  hosts: an explicit list you already have. show_dead: also list non-responding
+  hosts. timeout: per-request seconds.
+
+OUTPUT — header then one line per live host:
+  "# http_probe: 23 targets, 21 live"
+  'https://vault.example.com/  [200]  "Vaultwarden Web"  server=cloudflare  len=23139  [tech: cloudflare]'
+  'https://www.example.com/  [200]  "Home"  server=nginx  -> https://example.com/  [tech: nginx]'
+  Fields: the working scheme+url, [HTTP status], "page title", server=, len=,
+  "-> final_url" if it redirected, and [tech: ...] fingerprint. Dead hosts are
+  hidden unless show_dead.
+
+HOW TO INTERPRET — what to look at first:
+  - Titles and tech are the fastest signal. Interesting titles (admin, login,
+    dashboard, vault, staging, dev, internal, jenkins, grafana, phpmyadmin) and
+    unusual tech are priority targets.
+  - Status: 200 = content; 401/403 = auth-gated (often the juicy stuff); 301/302
+    with "->" shows where it really lives; 500/502/503/525 = broken origin (still
+    a real host, maybe a takeover or a dev box that's down).
+  - server= and tech reveal the stack to tailor the next step (WordPress -> wpscan,
+    IIS -> Windows, etc.).
+
+WHAT TO DO NEXT
+  - Feed interesting live hosts into tls_audit (headers/TLS), directory brute
+    forcing (ffuf/gobuster on the box), or a manual look.
+  - 401/403 hosts: try default creds, path bypasses, or note for later.
+  - Redirects to a different host/domain can reveal new scope.
+
+FAILURE / RETRY
+  A host with no line (and not shown) simply didn't respond on 80/443 — it may
+  still have services on other ports (check with nmap). enum=true needs the domain
+  to resolve and have findable subdomains.
+"""
+
 TLS_AUDIT = """\
 Audit a host's TLS configuration and HTTP security headers in one call. Reports
 the negotiated protocol/cipher, which TLS versions the server accepts (flagging
@@ -178,6 +225,57 @@ WHAT TO DO NEXT
   - For weak TLS, confirm cipher/curve details with `nmap --script ssl-enum-ciphers`
     or `sslscan` on the box for a deeper view.
   - Missing headers feed directly into a web-app finding write-up.
+"""
+
+TRIAGE = """\
+Static triage of a suspicious FILE — a compact structured report an LLM can reason
+over. Runs fully static (never executes the sample): hashes, file type, entropy,
+extracted strings bucketed into IOCs, deep PE analysis (pefile) or an ELF header
+read, and a ranked list of red flags. Works on any file.
+
+WHEN TO USE
+  You have a binary/sample/dropped file and want to know what it is and whether
+  it's malicious, fast — before (or instead of) opening a disassembler. Great first
+  pass; pairs with your own reading of the disassembly for anything interesting.
+
+INPUT
+  file: path to the sample. min_str: min string length (default 4; raise to cut
+  noise). max_strings: cap on sample strings returned.
+
+OUTPUT — read top-down:
+  "# type: PE/DOS executable  size: 360448  entropy: 6.483" and the SHA256/MD5/SHA1.
+  "## RED FLAGS" — the ranked judgement calls; read these first. Examples: high
+  whole-file or per-section entropy (packed/encrypted), RWX sections, a section
+  with virtual size but no raw data (unpacks at runtime), suspicious API imports,
+  TLS callbacks (code before entry point), suspicious strings, embedded network IOCs.
+  "## PE ..." — machine/subsystem/entry/imphash/compile-time, then a section table
+  (name vsize rawsize entropy flags) and the suspicious import list.
+  "## ELF ..." — class/endian/type/machine/entry/interp.
+  "## urls/ips/domains/registry/win_paths/emails" — extracted IOCs.
+
+HOW TO INTERPRET — the intuition:
+  - Entropy > ~7.2 (whole file or a section) almost always means packed/encrypted
+    (UPX, a crypter). A tiny import table + one big high-entropy section is the
+    classic packed look — expect to unpack before deeper analysis.
+  - imphash lets you cluster/compare against known families. compile_time can be
+    faked (many samples show 2001/1970/absurd dates) — treat as a weak signal.
+  - Suspicious imports tell you capability: VirtualAlloc+WriteProcessMemory+
+    CreateRemoteThread = process injection; InternetOpen/URLDownloadToFile =
+    downloader; RegSetValue = persistence; IsDebuggerPresent = anti-analysis.
+  - RWX section or "virtual size but no raw data" = self-modifying/unpacking.
+  - A benign OS binary also imports some of these — weigh the WHOLE picture
+    (entropy + imports + strings + IOCs), not any one flag.
+
+WHAT TO DO NEXT
+  - Packed? unpack (UPX -d, or run in a sandbox and dump) then re-triage.
+  - Copy the SHA256 to check reputation/VT out of band; copy IOCs into your notes.
+  - For real analysis, open it in Ghidra/objdump and read the code around the entry
+    point and the suspicious imports — you (the model) are good at pseudo-C.
+
+FAILURE / RETRY
+  "PE: pefile not installed" -> the generic report still works; install pefile for
+  the section/import detail. "file not found" -> bad path. Handle real samples in an
+  isolated VM; this tool only reads, but downstream steps may execute.
 """
 
 PCAP = """\
