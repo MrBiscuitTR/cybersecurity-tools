@@ -189,6 +189,136 @@ FAILURE / RETRY
   to resolve and have findable subdomains.
 """
 
+LOG_TRIAGE = """\
+Triage an auth or web-server log and surface attacks/anomalies. Parses SSH auth
+logs (sshd) and Apache/Nginx access logs (auto-detected per line) and returns a
+ranked summary. Read-only.
+
+WHEN TO USE
+  You have a log file (from a compromised box, a honeypot, an engagement, or your
+  own server) and want to know "what happened / is happening" without scrolling
+  thousands of lines. Also good on the target after access to spot other actors.
+
+INPUT
+  file: path to the log. top: max entries per ranking.
+
+OUTPUT
+  "## SSH BRUTE-FORCE sources" — "[!] IP  N fails  users=..." (>=5 failures).
+  "## SSH successful logins" — user@ip (pair a brute-forcer with a later success!).
+  "## WEB ATTACKS" — "[sqli|xss|traversal|rce|lfi-rfi|log4shell] IP METHOD path -> status".
+  "## scanners" — tool (sqlmap/nikto/nuclei/...) + request count + source IPs.
+  "# top IPs" and "# status codes" for volume/anomaly context.
+
+HOW TO INTERPRET
+  - A brute-force IP that ALSO appears in successful logins = likely compromise —
+    investigate that account/session first.
+  - Web attack lines with a 200 status are the scary ones (payload may have worked);
+    404/403 usually means blocked/not-found, but still shows what was probed.
+  - Scanner UAs (sqlmap, nuclei) mark automated attacks; a flood of 4xx from one IP
+    is directory brute-forcing.
+
+WHAT TO DO NEXT
+  - Block/note attacker IPs; pull the full requests for a hit with grep on the box.
+  - For a successful-after-bruteforce login, check that user's activity and rotate creds.
+
+FAILURE / RETRY
+  0 findings can mean a clean log or an unrecognized format (only sshd + access
+  logs are parsed). "file not found" -> bad path.
+"""
+
+ASN = """\
+Map an organization's network footprint. Given an IP, domain, or ASN, resolves the
+owning autonomous system and lists every prefix it announces — expanding one host
+into the org's routed address space. Passive OSINT via RIPEstat (no auth).
+
+WHEN TO USE
+  Scoping/expansion during recon: turn a single in-scope IP or domain into the
+  full set of netblocks the same org owns (more hosts, more attack surface).
+
+INPUT
+  target: an IP ("1.1.1.1"), a domain ("example.com", resolved first), or an ASN
+  ("AS13335" or "13335"). max_prefixes caps how many are shown (JSON has all).
+
+OUTPUT
+  "# resolved IP: X  (announced as A.B.C.0/24)" for IP/domain inputs, then per ASN:
+  "## AS13335  CLOUDFLARENET  (5294 prefixes)" and the prefix list (v4 then v6).
+
+HOW TO INTERPRET
+  - The announced prefix of your host is the immediate neighborhood; the full ASN
+    prefix list is everything that org routes — but CONFIRM SCOPE before touching
+    other netblocks (an ASN can host many customers, e.g. a cloud provider).
+  - A domain behind Cloudflare/Akamai will show the CDN's ASN, not the origin —
+    the netblocks are the CDN's, so this is less useful there (find the origin first).
+
+WHAT TO DO NEXT
+  - Feed in-scope prefixes into a port scanner (nmap/masscan on the box) or reverse-DNS
+    sweep to find live hosts across the org's space.
+
+FAILURE / RETRY
+  "no ASN found" = the IP isn't in the routing table or RIPEstat had no data. A huge
+  prefix count on a cloud ASN is expected, not an error.
+"""
+
+FAVICON = """\
+Compute a site's favicon hash (Shodan's MurmurHash3 scheme) and emit ready-to-run
+Shodan/FOFA/ZoomEye queries. A favicon is often reused across ALL of an org's
+infrastructure, so its hash pivots to related/hidden hosts (origins behind a CDN,
+staging, sister sites). Read-only.
+
+WHEN TO USE
+  After finding any web host, to discover other hosts serving the same favicon —
+  a classic way to find a CDN-hidden origin or an org's wider infrastructure.
+
+INPUT
+  target: a page URL (its <link rel=icon> is found, else /favicon.ico) or a direct
+  favicon URL.
+
+OUTPUT
+  "# mmh3 hash: <signed int>" and a "## pivots" block with the exact search strings:
+  shodan "http.favicon.hash:<h>", fofa 'icon_hash="<h>"', zoomeye 'iconhash:"<h>"'.
+
+HOW TO INTERPRET / NEXT
+  - Run the emitted query in Shodan/FOFA (needs your own account) to get the list of
+    IPs sharing the icon. Matches that are NOT behind the CDN are likely the real
+    origin — a direct-to-origin path that bypasses WAF/CDN protections.
+  - A default/framework favicon (e.g. stock Apache/Tomcat) will match thousands of
+    unrelated hosts — only useful when the icon is org-specific.
+
+FAILURE / RETRY
+  "could not fetch favicon" -> the site has none at the usual place; point target at
+  the real icon URL. The hash is computed locally; the search itself is your step.
+"""
+
+SECRETS_SCAN = """\
+Scan a file or directory tree for leaked secrets (gitleaks-style): API keys, tokens,
+private keys, and generic secret assignments, reported as file:line. Read-only.
+
+WHEN TO USE
+  On any source you've obtained — a cloned repo, a web root, dumped files, an
+  extracted archive/firmware, downloaded JS. Finds credentials that lead to further
+  access.
+
+INPUT
+  path: a file or directory. max_size: skip files larger than this (default 1MB).
+  Skips .git/node_modules/binaries automatically.
+
+OUTPUT
+  "# by type: aws-access-key=1, github-token=2, ..." then
+  "[type] path/file:line  AKIAIO…MPLE" (values are partially redacted in text; use
+  --json / the file:line to retrieve the full secret from the source).
+
+HOW TO INTERPRET / NEXT
+  - Each hit is a lead: validate it against its service (only if authorized) — an
+    AWS key with `aws sts get-caller-identity`, a GitHub token with the API, etc.
+  - A private-key or *_live_ secret is high-value; a "generic-secret" may be a false
+    positive (a placeholder/example) — check the surrounding code.
+  - Feed a found JWT into the jwt tool; feed cloud keys into the relevant CLI.
+
+FAILURE / RETRY
+  "no secrets matched" is a clean result. "path not found" -> bad path. Findings are
+  REAL secrets — handle carefully, never commit them.
+"""
+
 JWT = """\
 Decode, audit, verify, forge, and attack JSON Web Tokens. One tool with an
 `action` argument — PICK THE ACTION, then pass ONLY that action's fields (getting

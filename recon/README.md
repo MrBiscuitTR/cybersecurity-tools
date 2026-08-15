@@ -47,3 +47,28 @@ transparency queries, email/username harvesting, metadata-based OSINT.
   python -m recon.http_probe example.com --enum
   python -m recon.http_probe --hosts hosts.txt --json
   ```
+
+- **[asn.py](asn.py)** — map an IP/domain/ASN to its autonomous system and every
+  announced netblock (via RIPEstat, no-auth). Expands one host into an org's routed
+  address space.
+
+  ```bash
+  python -m recon.asn example.com
+  python -m recon.asn AS13335 --json
+  ```
+
+- **[favicon.py](favicon.py)** — compute a site's favicon hash (Shodan's mmh3,
+  implemented in pure Python) and emit Shodan/FOFA/ZoomEye pivots to find hosts
+  sharing it (e.g. a CDN-hidden origin).
+
+  ```bash
+  python -m recon.favicon https://example.com
+  ```
+
+- **[secrets_scan.py](secrets_scan.py)** — scan a file/dir tree for leaked secrets
+  (API keys, tokens, private keys) as `file:line`. Shares the ruleset with
+  [../web/js_recon.py](../web/js_recon.py).
+
+  ```bash
+  python -m recon.secrets_scan ./src --json
+  ```

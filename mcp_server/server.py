@@ -19,11 +19,15 @@ from __future__ import annotations
 
 import sys
 
+from forensics import log_triage as _log_triage
 from forensics import pcap as _pcap
 from malware import triage as _triage
 from mcp_server import guides
+from recon import asn as _asn
 from recon import dns_records as _dns_records
+from recon import favicon as _favicon
 from recon import http_probe as _http_probe
+from recon import secrets_scan as _secrets_scan
 from recon import subdomains as _subdomains
 from recon import takeover as _takeover
 from web import js_recon as _js_recon
@@ -132,6 +136,30 @@ def build_app():
         description for the FINDINGS ranking. Returns compact text."""
         res = _tls_audit.run(target, version_probe=version_probe)
         return "\n".join(_tls_audit._compact_lines(res))
+
+    @app.tool(description=guides.ASN)
+    def asn(target: str, max_prefixes: int = 500) -> str:
+        """Map an IP/domain/ASN to its autonomous system and announced netblocks.
+        See the tool description (mind scope on shared cloud ASNs). Compact text."""
+        return "\n".join(_asn._compact_lines(_asn.run(target, max_prefixes=max_prefixes)))
+
+    @app.tool(description=guides.FAVICON)
+    def favicon(target: str) -> str:
+        """Compute a site's favicon hash + Shodan/FOFA/ZoomEye pivots to find hosts
+        sharing it (e.g. a CDN-hidden origin). Returns compact text."""
+        return "\n".join(_favicon._compact_lines(_favicon.run(target)))
+
+    @app.tool(description=guides.SECRETS_SCAN)
+    def secrets_scan(path: str, max_size: int = 1_000_000) -> str:
+        """Scan a file/dir for leaked secrets (API keys, tokens, private keys) as
+        file:line. Findings are REAL secrets — handle carefully. Compact text."""
+        return "\n".join(_secrets_scan._compact_lines(_secrets_scan.run(path, max_size=max_size)))
+
+    @app.tool(description=guides.LOG_TRIAGE)
+    def log_triage(file: str, top: int = 15) -> str:
+        """Triage an auth/web log: brute force, web attacks, scanners, anomalies.
+        See the tool description for interpretation. Returns compact text."""
+        return "\n".join(_log_triage._compact_lines(_log_triage.run(file, top=top)))
 
     @app.tool(description=guides.TRIAGE)
     def triage_file(file: str, min_str: int = 4, max_strings: int = 200) -> str:

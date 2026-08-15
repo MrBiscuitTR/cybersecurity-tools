@@ -39,3 +39,12 @@ capture analysis, file carving, hash-based file identification.
   ```
 
   Requires `tshark` (Wireshark). On Kali: `apt install tshark`.
+
+- **[log_triage.py](log_triage.py)** — triage auth/web-server logs: SSH brute-force
+  sources + successful logins, web attack payloads (SQLi/XSS/traversal/RCE/LFI/
+  log4shell), scanner user-agents, and status/volume anomalies. Stdlib-only.
+
+  ```bash
+  python -m forensics.log_triage /var/log/auth.log
+  python -m forensics.log_triage access.log --json
+  ```
