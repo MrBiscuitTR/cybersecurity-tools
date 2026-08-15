@@ -264,6 +264,19 @@ def _arp(bin_: str, path: str) -> list[dict]:
     return out
 
 
+def _decode_ssid(raw: str) -> str:
+    """tshark emits wlan.ssid as a hex string; decode to readable text. A hidden
+    network shows as empty/<MISSING> -> report it as <hidden>."""
+    if not raw or raw == "<MISSING>":
+        return "<hidden>"
+    try:
+        text = bytes.fromhex(raw).decode("utf-8", "replace")
+        # Wildcard/hidden probes are all-zero or empty once decoded.
+        return text if text.strip("\x00").strip() else "<hidden>"
+    except ValueError:
+        return raw  # already text on some tshark builds
+
+
 def _wifi(bin_: str, path: str) -> dict:
     beacons, seen_b = [], set()
     for r in _fields(bin_, path, ["wlan.ssid", "wlan.bssid", "wlan_radio.channel"],
@@ -272,7 +285,7 @@ def _wifi(bin_: str, path: str) -> dict:
         ssid, bssid, chan = r[:3]
         if bssid and bssid not in seen_b:
             seen_b.add(bssid)
-            beacons.append({"ssid": ssid or "<hidden>", "bssid": bssid, "channel": chan})
+            beacons.append({"ssid": _decode_ssid(ssid), "bssid": bssid, "channel": chan})
     probes, seen_p = [], set()
     for r in _fields(bin_, path, ["wlan.ssid", "wlan.sa"], "wlan.fc.type_subtype==0x04"):
         r += [""] * (2 - len(r))
@@ -280,7 +293,7 @@ def _wifi(bin_: str, path: str) -> dict:
         key = (ssid, sa)
         if key not in seen_p:
             seen_p.add(key)
-            probes.append({"ssid": ssid or "<broadcast>", "station": sa})
+            probes.append({"ssid": _decode_ssid(ssid), "station": sa})
     return {"beacons": beacons, "probe_requests": probes}
 
 
