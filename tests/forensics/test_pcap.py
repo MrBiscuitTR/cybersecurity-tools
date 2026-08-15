@@ -45,6 +45,22 @@ def test_ip_key_sorts_numerically():
     assert sorted(ips, key=pcap._ip_key)[:3] == ["10.0.0.1", "192.168.0.2", "192.168.0.10"]
 
 
+def test_spn_from_sname():
+    assert pcap._spn_from_sname("ldap,host.dom,dom") == "ldap/host.dom"
+    assert pcap._spn_from_sname("krbtgt,REALM") == ""      # TGT, not roastable
+    assert pcap._spn_from_sname("") == ""
+
+
+def test_compact_renders_labeled_creds():
+    res = {"file": "x.pcap", "sections": {"creds": [
+        {"kind": "ftp", "user": "anonymous", "password": "a@b"},
+        {"kind": "kerberoast-spn", "spn": "ldap/dc01", "note": "crack a TGS"},
+    ]}}
+    lines = pcap._compact_lines(res)
+    assert any("[ftp] user=anonymous  password=a@b" in ln for ln in lines)
+    assert any("[kerberoast-spn] spn=ldap/dc01  (crack a TGS)" in ln for ln in lines)
+
+
 def test_compact_renders_loot_and_wifi():
     res = {"file": "x.pcap", "sections": {
         "creds": [{"kind": "ntlmv2", "value": "u::D:aa:bb:cc", "note": "hashcat -m 5600"}],

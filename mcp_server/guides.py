@@ -311,16 +311,21 @@ MODE 1 - DIGEST (call with just `file`, optionally `sections`)
               by correlating the BSSID with probe-responses/association-requests
               ([SSID REVEALED]). Also flags captured WPA/WPA2 EAPOL handshakes
               (crackable offline). Appears only on monitor-mode captures.
-    creds     LOOT: cleartext logins (HTTP/FTP/Telnet/IMAP/POP/SMTP), SNMP community
-              strings, Kerberos principals/SPNs, and CRACKABLE net-NTLM hashes
-              formatted for hashcat (v1=mode 5500, v2=mode 5600 — noted per line).
+    creds     LOOT, labeled and paired where possible. Lines look like
+              "[kind] user=..  password=..  host=..  hash=..  (note)". Kinds:
+              cleartext logins (ftp/imap/pop/telnet/http-basic, user+password
+              paired); SNMP community strings; net-NTLM hashes (ntlmv1/v2, with
+              hash= and the hashcat mode in the note); Kerberos (kerberoast-spn =
+              a roastable SPN; kerberoast/asrep-roast = a ready $krb5tgs$/$krb5asrep$
+              hash when the ticket cipher was captured). SMB shares/files appear in
+              the "files" section ([smb-share] \\host\share).
   Narrow with sections (e.g. "creds,hosts,files") on large captures to save tokens.
 
-  KEY LOOT TO ACT ON: a "creds" line like
-    "[ntlmv2] user::DOMAIN:chal:proof:blob  (hashcat -m 5600)"
-  is a ready-to-crack hash — copy the value into a file and run the noted hashcat
-  mode with a wordlist. SNMP community strings and IMAP/telnet logins are often
-  directly usable. Kerberos SPNs are kerberoast targets.
+  KEY LOOT TO ACT ON:
+    "[ntlmv2] user=.. hash=user::DOMAIN:chal:proof:blob  (hashcat -m 5600)" is a
+    ready-to-crack hash — save the hash= value and run the noted hashcat mode.
+    "[kerberoast-spn] spn=MSSQL/db01" is a kerberoast target (request+crack a TGS).
+    Paired "[ftp] user=.. password=.." / "[imap] ..." are often directly usable.
 
 MODE 2 - FOLLOW A STREAM (set `stream`)
   stream="5" follows TCP stream 5; stream="udp:3" follows UDP stream 3. Returns the

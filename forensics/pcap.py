@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 from common import proc
@@ -327,22 +328,103 @@ def _wifi(bin_: str, path: str) -> dict:
     return {"beacons": beacons, "probe_requests": probes, "wpa_handshakes": handshakes}
 
 
+# Order credentials are shown in: crackable hashes first, then paired logins,
+# then single-value secrets, then leads. Lower number = shown earlier.
+_CRED_ORDER = {
+    "ntlmv2": 0, "ntlmv1": 0, "kerberoast": 1, "asrep-roast": 1,
+    "ftp": 2, "imap": 2, "pop": 2, "http-basic": 2, "telnet": 2, "smtp-auth": 2,
+    "http-post": 3, "snmp-community": 4, "snmpv3-user": 5, "radius-user": 5,
+    "kerberoast-spn": 6, "kerberos-user": 6,
+}
+
+
 def _creds(bin_: str, path: str) -> list[dict]:
-    """Extract credentials/loot an operator can actually use: cleartext logins,
-    crackable net-NTLM hashes, SNMP community strings, Kerberos principals, etc.
-    Heuristic — every hit is a lead to confirm, but many are directly usable."""
+    """Extract credentials/loot an operator can use, LABELED and PAIRED where the
+    protocol lets us (user+password together, decoded HTTP Basic, FTP/POP pairing,
+    crackable net-NTLM/Kerberos hashes). Falls back to a raw dump only when the
+    value can't be split deterministically. Heuristic, but mostly directly usable.
+
+    Each entry: {kind, ...fields}. Fields vary by kind: user, password, domain,
+    host, spn, realm, hash, note, raw.
+    """
     found: list[dict] = []
     seen: set = set()
 
-    def add(kind, value, **kw):
-        key = (kind, value)
-        if value and key not in seen:
+    def add(kind, **fields):
+        fields = {k: v for k, v in fields.items() if v}
+        key = (kind, tuple(sorted(fields.items())))
+        if key not in seen:
             seen.add(key)
-            found.append({"kind": kind, "value": value, **kw})
+            found.append({"kind": kind, **fields})
 
-    # --- net-NTLM (crackable with hashcat: v2=mode 5600, v1=mode 5500) ---
-    # The server challenge (Type-2 CHALLENGE) and the client response (Type-3
-    # AUTHENTICATE) are in different packets, so correlate them by TCP stream.
+    _ntlm(bin_, path, add)
+    _kerberos_creds(bin_, path, add)
+
+    # SNMP: community string is effectively a password; v3 has usernames.
+    for r in _fields(bin_, path, ["snmp.community"], "snmp.community"):
+        if r and r[0]:
+            add("snmp-community", password=r[0])
+    for r in _fields(bin_, path, ["snmp.msgUserName"], "snmp.msgUserName"):
+        if r and r[0]:
+            add("snmpv3-user", user=r[0])
+
+    # IMAP LOGIN "user" "pass" -> paired.
+    for r in _fields(bin_, path, ["imap.request"], "imap.request"):
+        if r and r[0] and "login" in r[0].lower():
+            m = re.search(r'login\s+"?([^"\s]+)"?\s+"?([^"\r\n]+?)"?\s*$', r[0], re.I)
+            if m:
+                add("imap", user=m.group(1), password=m.group(2))
+            else:
+                add("imap", raw=r[0].strip()[:200])
+
+    # POP USER/PASS paired by TCP stream.
+    _pair_by_stream(bin_, path, add, "pop",
+                    'pop.request.command=="USER" || pop.request.command=="PASS"',
+                    "pop.request.command", "pop.request.parameter")
+    # FTP USER/PASS paired by TCP stream.
+    _pair_by_stream(bin_, path, add, "ftp",
+                    'ftp.request.command=="USER" || ftp.request.command=="PASS"',
+                    "ftp.request.command", "ftp.request.arg")
+
+    for r in _fields(bin_, path, ["smtp.req.parameter"], 'smtp.req.command=="AUTH"'):
+        if r and r[0]:
+            add("smtp-auth", raw=r[0][:200], note="base64 - decode for user:pass")
+
+    for r in _fields(bin_, path, ["radius.User_Name"], "radius.User_Name"):
+        if r and r[0]:
+            add("radius-user", user=r[0])
+
+    # HTTP Basic auth -> decode base64 to user:pass; else keep raw.
+    for r in _fields(bin_, path, ["http.authorization", "http.host"], "http.authorization"):
+        if not (r and r[0]):
+            continue
+        host = r[1] if len(r) > 1 else ""
+        val = r[0]
+        if val.lower().startswith("basic "):
+            try:
+                import base64
+                user, _, pw = base64.b64decode(val.split(None, 1)[1]).decode(
+                    "utf-8", "replace").partition(":")
+                add("http-basic", host=host, user=user, password=pw)
+                continue
+            except Exception:
+                pass
+        add("http-basic", host=host, raw=val[:200])
+    for r in _fields(bin_, path, ["http.host", "http.file_data"], 'http.request.method=="POST"'):
+        if len(r) > 1 and r[1] and ("pass" in r[1].lower() or "pwd" in r[1].lower()):
+            add("http-post", host=r[0], raw=r[1][:300])
+
+    for r in _fields(bin_, path, ["telnet.data"], 'telnet.data matches "(?i)(login|password)"'):
+        if r and r[0]:
+            add("telnet", raw=r[0].strip()[:200])
+
+    found.sort(key=lambda c: (_CRED_ORDER.get(c["kind"], 9), c["kind"]))
+    return found
+
+
+def _ntlm(bin_: str, path: str, add) -> None:
+    """net-NTLM v1/v2 hashes, correlating the Type-2 challenge with the Type-3
+    response by TCP stream (they're in different packets)."""
     challenges: dict[str, str] = {}
     for r in _fields(bin_, path, ["tcp.stream", "ntlmssp.ntlmserverchallenge"],
                      "ntlmssp.messagetype==0x00000002"):
@@ -356,66 +438,74 @@ def _creds(bin_: str, path: str) -> list[dict]:
         stream, domain, user, ntresp, lmresp = r[:5]
         chal = challenges.get(stream, "")
         if not (user and ntresp and chal) or user.upper() == "NULL":
-            continue  # skip anonymous/null sessions (not crackable, not useful)
-        if len(ntresp) > 48:                       # NTLMv2: 16B NTProofStr + blob
+            continue
+        if len(ntresp) > 48:                       # NTLMv2
             proof, blob = ntresp[:32], ntresp[32:]
-            add("ntlmv2", f"{user}::{domain}:{chal}:{proof}:{blob}", note="hashcat -m 5600")
+            add("ntlmv2", user=user, domain=domain,
+                hash=f"{user}::{domain}:{chal}:{proof}:{blob}", note="hashcat -m 5600")
         else:                                      # NTLMv1
             lm = lmresp or ntresp
-            add("ntlmv1", f"{user}::{domain}:{lm}:{ntresp}:{chal}", note="hashcat -m 5500")
+            add("ntlmv1", user=user, domain=domain,
+                hash=f"{user}::{domain}:{lm}:{ntresp}:{chal}", note="hashcat -m 5500")
 
-    # --- SNMP community strings (community == password) + SNMPv3 users ---
-    for r in _fields(bin_, path, ["snmp.community"], "snmp.community"):
-        if r and r[0]:
-            add("snmp-community", r[0])
-    for r in _fields(bin_, path, ["snmp.msgUserName"], "snmp.msgUserName"):
-        if r and r[0]:
-            add("snmpv3-user", r[0])
 
-    # --- cleartext mail/login protocols ---
-    for r in _fields(bin_, path, ["imap.request"], "imap.request"):
-        if r and r[0] and "login" in r[0].lower():
-            add("imap", r[0].strip()[:200])
-    for r in _fields(bin_, path, ["pop.request.command", "pop.request.parameter"],
-                     'pop.request.command=="USER" || pop.request.command=="PASS"'):
-        r += [""] * (2 - len(r))
-        add("pop", f"{r[0]} {r[1]}".strip())
-    for r in _fields(bin_, path, ["smtp.req.parameter"], 'smtp.req.command=="AUTH"'):
-        if r and r[0]:
-            add("smtp-auth", r[0][:200])
-
-    # --- Kerberos principals (kerberoast / AS-REP-roast leads) ---
-    for r in _fields(bin_, path, ["kerberos.CNameString", "kerberos.realm"],
-                     "kerberos.CNameString"):
-        r += [""] * (2 - len(r))
-        if r[0] and not r[0].endswith("$"):        # skip machine accounts
-            add("kerberos-user", f"{r[0]}@{r[1]}")
+def _kerberos_creds(bin_: str, path: str, add) -> None:
+    """Kerberos loot: usernames, kerberoastable SPNs, and — when the ticket cipher
+    is exposed — ready-to-crack $krb5tgs$ (TGS-REP) / $krb5asrep$ (AS-REP) hashes."""
+    # SPNs seen in TGS requests/replies are kerberoast targets. tshark emits the
+    # SNameString components comma-separated ("service,host,..."); rebuild "service/host"
+    # and skip krbtgt (that's the TGT service, not a roastable account).
     for r in _fields(bin_, path, ["kerberos.SNameString"], "kerberos.SNameString"):
-        if r and r[0] and "/" in r[0]:             # SPNs are kerberoastable
-            add("kerberos-spn", r[0])
+        spn = _spn_from_sname(r[0] if r else "")
+        if spn:
+            add("kerberoast-spn", spn=spn, note="request/crack a TGS for this SPN")
+    # Usernames from AS-REQ (msg_type 10).
+    for r in _fields(bin_, path, ["kerberos.CNameString", "kerberos.realm"],
+                     "kerberos.msg_type==10"):
+        r += [""] * (2 - len(r))
+        if r[0] and not r[0].endswith("$"):
+            add("kerberos-user", user=r[0], realm=r[1])
+    # Best-effort hash extraction when the encrypted part is present.
+    for msg_type, kind, prefix, mode in (("13", "kerberoast", "krb5tgs", "13100"),
+                                         ("11", "asrep-roast", "krb5asrep", "18200")):
+        for r in _fields(bin_, path,
+                         ["kerberos.SNameString", "kerberos.CNameString",
+                          "kerberos.realm", "kerberos.etype", "kerberos.cipher"],
+                         f"kerberos.msg_type=={msg_type} && kerberos.cipher"):
+            r += [""] * (5 - len(r))
+            spn, user, realm, etype, cipher = r[:5]
+            if not cipher or len(cipher) < 32:
+                continue
+            checksum, edata = cipher[:32], cipher[32:]
+            spn = _spn_from_sname(spn)
+            h = f"${prefix}${etype or 23}$*{user}${realm}${spn}*${checksum}${edata}"
+            add(kind, user=user, spn=spn, hash=h, note=f"hashcat -m {mode}")
 
-    # --- RADIUS ---
-    for r in _fields(bin_, path, ["radius.User_Name"], "radius.User_Name"):
-        if r and r[0]:
-            add("radius-user", r[0])
 
-    # --- HTTP auth / form posts / cookies ---
-    for r in _fields(bin_, path, ["http.authorization", "http.host"], "http.authorization"):
-        if r and r[0]:
-            add("http-authorization", r[0], host=r[1] if len(r) > 1 else "")
-    for r in _fields(bin_, path, ["http.host", "http.file_data"], 'http.request.method=="POST"'):
-        if len(r) > 1 and r[1] and ("pass" in r[1].lower() or "pwd" in r[1].lower()):
-            add("http-post", r[1][:300], host=r[0])
+def _spn_from_sname(sname: str) -> str:
+    """Rebuild a 'service/host' SPN from tshark's comma-separated SNameString.
+    Returns '' for empty or krbtgt (the TGT service, not kerberoastable)."""
+    parts = [p for p in (sname or "").split(",") if p]
+    if len(parts) < 2 or parts[0].lower() == "krbtgt":
+        return ""
+    return f"{parts[0]}/{parts[1]}"
 
-    # --- FTP / Telnet ---
-    for r in _fields(bin_, path, ["ftp.request.command", "ftp.request.arg"],
-                     'ftp.request.command=="USER" || ftp.request.command=="PASS"'):
-        if r and r[0]:
-            add("ftp", f"{r[0]} {r[1] if len(r) > 1 else ''}".strip())
-    for r in _fields(bin_, path, ["telnet.data"], 'telnet.data matches "(?i)(login|password)"'):
-        if r and r[0]:
-            add("telnet", r[0].strip()[:200])
-    return found
+
+def _pair_by_stream(bin_: str, path: str, add, kind: str, dfilter: str,
+                    cmd_field: str, arg_field: str) -> None:
+    """Pair USER/PASS commands that share a TCP stream into one credential."""
+    by_stream: dict[str, dict] = {}
+    for r in _fields(bin_, path, ["tcp.stream", cmd_field, arg_field], dfilter):
+        r += [""] * (3 - len(r))
+        stream, cmd, arg = r[:3]
+        slot = by_stream.setdefault(stream, {})
+        if cmd.upper() == "USER":
+            slot["user"] = arg
+        elif cmd.upper() == "PASS":
+            slot["password"] = arg
+    for slot in by_stream.values():
+        if slot:
+            add(kind, **slot)
 
 
 def _hosts(bin_: str, path: str) -> list[dict]:
@@ -433,16 +523,19 @@ def _hosts(bin_: str, path: str) -> list[dict]:
         first = ip.split(".")[0]
         return not (first.isdigit() and 224 <= int(first) <= 255)  # drop multicast/broadcast
 
-    def bind_mac(ip, mac):
-        if not _real_host(ip):
-            return
-        for m in (mac or "").split(","):            # a field may carry >1 value
-            if m and m not in _skip_mac:
-                macs.setdefault(ip, set()).add(m)
+    def bind_mac(ip_field, mac):
+        # An encapsulated frame can carry >1 ip/mac; split and bind each real one.
+        for ip in (ip_field or "").split(","):
+            if not _real_host(ip):
+                continue
+            for m in (mac or "").split(","):
+                if m and m not in _skip_mac:
+                    macs.setdefault(ip, set()).add(m)
 
-    def bind_name(ip, name):
-        if _real_host(ip) and name:
-            names.setdefault(ip, set()).add(name)
+    def bind_name(ip_field, name):
+        for ip in (ip_field or "").split(","):
+            if _real_host(ip) and name:
+                names.setdefault(ip, set()).add(name)
 
     for r in _fields(bin_, path, ["ip.src", "eth.src", "ip.dst", "eth.dst"], "ip && eth"):
         r += [""] * (4 - len(r))
@@ -517,6 +610,13 @@ def _files(bin_: str, path: str) -> list[dict]:
     for r in _fields(bin_, path, ["smb.file"], "smb.file"):
         if r and r[0]:
             add("smb", r[0])
+    # SMB shares accessed (tree connects) — access targets worth noting.
+    for r in _fields(bin_, path, ["smb2.tree"], "smb2.tree"):
+        if r and r[0]:
+            add("smb-share", r[0])
+    for r in _fields(bin_, path, ["smb.path"], "smb.path"):
+        if r and r[0]:
+            add("smb-share", r[0])
     for r in _fields(bin_, path, ["tftp.source_file", "tftp.destination_file"], "tftp"):
         r += [""] * (2 - len(r))
         add("tftp", r[0] or r[1])
@@ -734,11 +834,17 @@ def _compact_lines(res: dict) -> list[str]:
             lines.append("# WPA/WPA2 EAPOL handshake captured (crackable) for: "
                          + ", ".join(w["wpa_handshakes"]))
     if s.get("creds"):
-        lines.append("## LOOT / POSSIBLE CREDS")
+        lines.append("## LOOT / CREDENTIALS")
+        # Field display order within a line; 'raw'/'hash'/'note' come last.
+        order = ["host", "domain", "realm", "user", "password", "spn", "hash", "raw", "note"]
         for c in s["creds"]:
-            note = f"  ({c['note']})" if c.get("note") else ""
-            host = f"{c['host']} " if c.get("host") else ""
-            lines.append(f"[{c['kind']}] {host}{c['value']}{note}".strip())
+            parts = []
+            for f in order:
+                if c.get(f):
+                    label = "" if f in ("raw",) else f + "="
+                    val = f"({c[f]})" if f == "note" else f"{label}{c[f]}"
+                    parts.append(val)
+            lines.append(f"[{c['kind']}] " + "  ".join(parts))
     return lines
 
 
