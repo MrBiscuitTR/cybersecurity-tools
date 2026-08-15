@@ -49,7 +49,9 @@ Every tool obeys these (full detail in [docs/CONVENTIONS.md](docs/CONVENTIONS.md
 | [passwords/](passwords/) | Credential *analysis* | strength/entropy scoring (no cracker clones) |
 | [forensics/](forensics/) | Artifacts & captures | metadata/log parsing, pcap readers for AI consumption |
 | [malware/](malware/) | Static triage only | PE/ELF headers, strings, imports, IOC extraction |
-| [reversing/](reversing/) | Reverse engineering | Ghidra-headless decompilation to pseudo-C |
+| [reversing/](reversing/) | Reverse engineering | decompile, disasm, bindiff, gadgets, symbolic, firmware, pwn-template |
+| [cloud/](cloud/) | Cloud attack surface | S3/GCS/Azure bucket hunting, AWS IAM enumeration |
+| [analyze/](analyze/) | AI reasoning layer | binary → prioritized exploitation action plan |
 | [common/](common/) | Shared helpers | HTTP (stdlib), JSON/compact output, validators, subprocess capture |
 | [mcp_server/](mcp_server/) | MCP server for the LLM operator | exposes tools + teaching-style usage guides |
 | [data/](data/) | Tiny fixtures only | (big lists live on the Kali box, passed by path) |

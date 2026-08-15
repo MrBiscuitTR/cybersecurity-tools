@@ -320,6 +320,314 @@ FAILURE / RETRY
   signature that didn't extract usually means a missing extractor utility.
 """
 
+GADGETS = """\
+Find and CATEGORIZE ROP/JOP gadgets in a binary for exploit development. Scans the
+executable regions for short sequences ending in ret (ROP), a register jmp/call
+(JOP), or syscall, and groups the useful ones: which gadget controls which register,
+syscall gadgets, stack pivots, and memory-write primitives. Self-contained (capstone,
+no ropper needed). Read-only static analysis.
+
+WHEN TO USE
+  Building a ROP chain (bypassing NX/DEP): after you have a leak/overflow and need
+  gadgets to set up registers and call a syscall or function. Also to check what a
+  binary/library offers.
+
+INPUT
+  file: an ELF/PE (executable regions are auto-located) or a raw blob with raw=true +
+  arch + base. search: a regex to grep gadgets ("pop rdi", "syscall"). all=true dumps
+  every gadget (large — prefer search). max_insns caps gadget length.
+
+OUTPUT
+  "# gadgets: ... (N unique)" then categories:
+    "## register-control" — "pop rdi ; ret  @ 0x...", "pop rsi ; pop r15 ; ret @ ..."
+    "## syscall", "## stack-pivot" (leave/xchg rsp/mov rsp), "## mem-write"
+      ("mov [rax], rbx ; ret" — an arbitrary write).
+  With search: "## matches" — just the gadgets hitting your regex.
+
+HOW TO INTERPRET / BUILD A CHAIN (x86-64 SysV):
+  - Args go in rdi, rsi, rdx, rcx, r8, r9 — find "pop rdi ; ret" etc. to load them.
+  - For execve("/bin/sh",0,0): set rax=59, rdi=ptr to "/bin/sh", rsi=rdx=0, then a
+    "syscall" gadget. Use search to find each: search="pop rax", "pop rdi", "syscall".
+  - A stack-pivot ("xchg rsp, rax ; ret") redirects the chain when your overflow is
+    limited. A mem-write gadget lets you plant "/bin/sh" in a known-writable address.
+  - Addresses are file/vaddr offsets; add the runtime base (PIE) from your leak.
+
+WHAT TO DO NEXT
+  - Combine the chosen gadgets into a chain in your exploit; if the binary is small,
+    also check libc (run this on the target's libc.so) for more gadgets.
+
+FAILURE / RETRY
+  Few gadgets = a small/hardened binary; try its linked libc. "capstone not installed"
+  -> pip install capstone. For non-x86 (ARM/MIPS firmware) gadget finding is best-effort.
+"""
+
+SYMBOLIC = """\
+Solve for program input with symbolic execution (angr): "what input makes this binary
+reach X / print Y?" Explores the program with a symbolic input and, on reaching the
+target, solves for the concrete bytes. Crushes crackmes, licence/passphrase checks,
+and "find the flag" challenges, and finds an input that drives a sample down a
+specific code path. angr runs the target in its OWN emulated environment (not natively).
+
+WHEN TO USE
+  You have a binary that checks an input (password, key, flag) and you want the input
+  that passes — instead of reversing the check by hand. Or you need an input that
+  reaches a particular address (a vuln, a hidden branch).
+
+INPUT (find is required)
+  binary: the target. find: an ADDRESS ("0x401337") to reach, OR a STRING to see in
+  stdout ("Correct", "flag{"). avoid: an address or stdout string to steer away from
+  (e.g. "denied") — speeds up and de-noises the search. argv=true delivers the input
+  as argv[1]; default is stdin. input_size: how many symbolic bytes (make it >= the
+  expected input length). max_steps: exploration budget.
+
+OUTPUT
+  "# SOLVED — input that reaches the target:" then the ascii repr and hex of the input,
+  and how to deliver it (stdin or argv[1]). Or "# not solved: ..." with a hint.
+
+HOW TO INTERPRET / NEXT
+  - The ascii/hex IS the answer — feed it to the real binary (echo it to stdin, or as
+    argv[1]) to confirm. It's constrained to printable bytes by default.
+  - Not solved usually means: input_size too small (the check reads more bytes), the
+    success string/addr was wrong (get the exact string from the strings/decompiler
+    output), or the path is too complex for the step budget (raise max_steps, or add
+    an avoid to prune the failing branch).
+
+FAILURE / RETRY
+  "angr not installed" -> pip install angr (heavy). Very branchy binaries (crypto,
+  large loops) can blow up state — narrow with avoid, a tighter input_size, or target
+  a specific address just past the check rather than a stdout string.
+"""
+
+BINDIFF = """\
+Diff two builds of a binary FUNCTION BY FUNCTION to find a security patch (1-day
+analysis). Given an OLD (vulnerable) and NEW (patched) binary, it reports which
+functions changed/were added/removed and shows the instruction-level diff of each
+change — the changed function is almost always the fix, and its diff tells you what
+the bug was. Read-only.
+
+WHEN TO USE
+  You have a program before and after a security update (or two firmware versions)
+  and want the vulnerability the patch fixed — without reversing the whole binary.
+  The classic path to a 1-day exploit.
+
+INPUT
+  old, new: the two binaries. Symbols help a lot (functions are matched by name);
+  stripped binaries match poorly. context/max_funcs tune the diff output size.
+
+OUTPUT
+  "# matched=.. changed=.. added=.. removed=.." then:
+  "## added/removed functions" (present in only one), and
+  "## CHANGED functions (least similar first)" — each with a similarity score and a
+  unified diff of the normalized disassembly (absolute addresses masked so only real
+  changes show).
+
+HOW TO INTERPRET — the intuition:
+  - A SMALL diff that adds a bounds check, a length argument (strcpy->strncpy), a
+    size comparison, an integer/signedness cast, or a NULL check IS the patch — and
+    tells you the bug (overflow, OOB, UAF, type confusion). Read those diffs first.
+  - similarity near 1.0 with a tiny +/- = a targeted security fix (high interest).
+    Big rewrites (low similarity) are more often refactors — still check them.
+  - Added functions can be new validators; removed functions, deleted dangerous paths.
+
+WHAT TO DO NEXT
+  - Decompile the changed function in BOTH binaries (the decompile tool) to read the
+    fix in C, then craft an input that reaches the old, unchecked path.
+  - Feed the identified vuln into pwn_template / symbolic to build/solve the exploit.
+
+FAILURE / RETRY
+  "no differences (symbols stripped)" -> function matching needs names; on stripped
+  builds, diff by decompiling specific addresses instead. objdump must be installed.
+"""
+
+PWN_TEMPLATE = """\
+Generate a working pwntools EXPLOIT SKELETON from an ELF. Statically reads the
+protections (NX/PIE/RELRO/canary), the overflow input vector, and whether there's a
+win()/system()/"/bin/sh", then picks an exploitation strategy and emits a runnable
+pwntools script for it — with a cyclic offset-finder baked in. Turns "here's a
+vulnerable binary" into "here's the exploit, just confirm the offset". Read-only
+(emits a script; runs nothing).
+
+WHEN TO USE
+  You've found (or suspect) a stack buffer overflow in an ELF and want the exploit
+  scaffold now instead of writing boilerplate. Great for CTF pwn and for validating
+  a real overflow.
+
+INPUT
+  binary: the ELF. host/port: bake a remote target into the script. (The generated
+  script needs pwntools installed to run.)
+
+OUTPUT
+  A protections summary (NX/PIE/canary/RELRO/static), the detected win/system/"/bin/sh"
+  and input vector, the chosen STRATEGY, then "## exploit.py" — the full script.
+
+STRATEGIES (auto-chosen) & WHAT THEY NEED:
+  ret2win    a win/backdoor function exists -> jump to it (simplest; watch stack
+             alignment — the script notes the 'ret' gadget fix).
+  ret2system system@plt + "/bin/sh" -> ROP system("/bin/sh").
+  ret2libc   NX + dynamic, no win -> leak libc via puts(puts@got), then system. You
+             must supply the target's libc (the script marks where).
+  shellcode  NX OFF -> executable stack; you still need a stack address (leak/ret2reg).
+  rop-generic fallback scaffold.
+
+HOW TO INTERPRET / NEXT
+  - Run the script; first use its find_offset() (cyclic) to get OFFSET, set it, rerun.
+  - canary=True: a straight overflow is caught — the script notes you must LEAK the
+    canary first. PIE=True: addresses need a leak (elf.address stays 0 until set).
+  - If ret2win crashes in a libc call, it's usually 16-byte stack misalignment — the
+    script already tells you to prepend a 'ret' gadget.
+
+FAILURE / RETRY
+  "not an ELF" -> this targets ELF (Linux). objdump is needed for symbol detection.
+  If no vector is obvious, the overflow may be via a custom read loop — set OFFSET
+  from your own analysis.
+"""
+
+GRAPHQL = """\
+Introspect and audit a GraphQL endpoint. If introspection is enabled it dumps the
+schema (queries/mutations/subscriptions/types) and flags security issues: introspection
+being open, sensitive-looking fields (password/token/secret), dangerous mutations
+(delete/admin/reset), and misconfigs (GET queries=CSRF). Read-only recon.
+
+WHEN TO USE: any GraphQL endpoint (often /graphql, /api/graphql, /v1/graphql). Maps the
+whole API surface at once.
+INPUT: url — the GraphQL endpoint.
+OUTPUT: "introspection=True/False", counts, "## FINDINGS" (ranked), the mutation and
+query lists ([!] marks dangerous mutations), and sensitive fields.
+INTERPRET/NEXT: introspection ENABLED = you have the whole schema — read the mutations
+for state-changing ops and query the sensitive fields (only if authorized). Dangerous
+mutations + weak auth = privilege escalation. Feed discovered field names/types into
+crafted queries. If introspection is disabled, try field-suggestion/clairvoyance or a
+known-schema wordlist.
+FAILURE: "introspection disabled or not a GraphQL endpoint" — the URL may be wrong or
+hardened; confirm it's GraphQL (POST {"query":"{__typename}"}).
+"""
+
+CORS = """\
+Test a URL for CORS misconfigurations that let another origin read its (authenticated)
+responses. Sends crafted Origin headers and inspects Access-Control-Allow-Origin/-Credentials
+to detect arbitrary-origin reflection, null-origin trust, prefix/suffix/subdomain bypasses,
+and wildcard+credentials. Read-only.
+
+WHEN TO USE: on authenticated API endpoints (the ones returning user data) — that's where a
+CORS bug is exploitable.
+INPUT: url — ideally an endpoint that returns sensitive/authenticated data.
+OUTPUT: "VULNERABLE / no critical issues", "## FINDINGS", and a raw table of each test origin
+-> ACAO + credentials.
+INTERPRET/NEXT: [HIGH] "reflects Origin AND allows credentials" is the real bug — an attacker
+page can fetch this endpoint with the victim's cookies and read the response; write a PoC
+fetch() from evil.com. Reflection without credentials is lower risk. "trusts null" is
+exploitable via a sandboxed iframe. A wildcard ACAO without credentials is safe by design.
+FAILURE: no findings just means the CORS policy is sane (or the endpoint sets no CORS headers).
+"""
+
+OAUTH = """\
+Map an OAuth2/OIDC deployment from its discovery document and flag config weaknesses.
+Fetches /.well-known/openid-configuration, lays out endpoints + supported flows/scopes/PKCE,
+and flags: implicit flow enabled (tokens leak in URL), missing/weak PKCE, 'none' client auth,
+open dynamic registration, plaintext endpoints. Read-only.
+
+WHEN TO USE: any app using OAuth/OIDC (an issuer URL, or you see /oauth//authorize, id_token,
+etc.). Gives the deployment's security posture in one call.
+INPUT: target — issuer base URL or the full discovery URL.
+OUTPUT: "## endpoints", response/grant types, "# PKCE:", scopes, and "## FINDINGS" (ranked).
+INTERPRET/NEXT: implicit flow ('token'/'id_token' in response_types) = go hunt for token leaks
+via redirect_uri/referrer. No PKCE / only 'plain' = auth-code interception on public clients.
+Next steps this tool sets up: test redirect_uri validation (open redirect / account takeover),
+state parameter (CSRF), and — with a captured JWT — the jwt tool. Missing findings = a
+reasonably hardened config, but redirect_uri/state bugs still need dynamic testing.
+FAILURE: "not JSON / HTTP error" — wrong issuer or no discovery doc; try the exact /.well-known URL.
+"""
+
+S3_HUNT = """\
+Hunt cloud storage buckets (AWS S3 / GCS / Azure Blob) from a keyword and flag public ones.
+Generates bucket-name permutations of a company/product/domain and checks each provider
+anonymously, reporting which exist and which are publicly LISTABLE. Or check one exact bucket
+with `bucket`. Read-only (never downloads/writes).
+
+WHEN TO USE: recon of any organization — exposed buckets are a top breach source. Run with the
+company name, product names, and the bare domain label.
+INPUT: keyword (permuted) OR bucket (one exact name).
+OUTPUT: "# s3_hunt: kw (N checked, X exist, Y PUBLIC)" then lines: "[!] [provider] name STATE url".
+STATE is PUBLIC-LISTABLE (jackpot — anyone can list it), exists-private, or absent.
+INTERPRET/NEXT: PUBLIC-LISTABLE = open the URL to list objects, then look for backups/dumps/keys
+(only if authorized). exists-private still confirms the org's naming scheme — pivot to more
+permutations, or try object-level reads on known paths. Combine with iam_enum if you find keys.
+FAILURE: no hits = these permutations missed; try more keywords (acronyms, internal names) or the
+exact bucket if you have a lead.
+"""
+
+IAM_ENUM = """\
+Enumerate what a set of AWS credentials can do — non-destructively. Confirms the identity
+(sts:GetCallerIdentity) then probes a curated list of READ-ONLY actions across services and
+reports which are allowed. Answers "I found this AWS key — what can it do?". Every probe is
+Get/List/Describe; nothing is created/modified/deleted.
+
+WHEN TO USE: whenever you obtain AWS credentials (from secrets_scan, js_recon, a config, a pcap).
+Provide them via env (AWS_ACCESS_KEY_ID/SECRET[/SESSION_TOKEN]) or a profile.
+INPUT: profile (optional; else env creds), region.
+OUTPUT: the identity (account/arn), then "## ALLOWED read-only actions" with a capability note
+each, and a denied count.
+INTERPRET/NEXT: the allowed set IS the foothold. iam:get_account_authorization_details or
+list_users = privesc recon; secretsmanager/ssm = go read secrets; s3:list_buckets = enumerate
+storage; ec2:describe_instances = map compute (and grab user-data). Chain into the specific
+service. Even a "read-only" key often reaches secrets.
+FAILURE: "boto3 not installed" -> pip install boto3. "credentials invalid" -> the key is dead/rotated.
+"""
+
+YARA_GEN = """\
+Generate a YARA rule from a sample for threat hunting. (YARA rules = string/byte patterns
+scanners use to identify malware families/samples.) Picks distinctive strings + a header byte
+pattern and emits a conditioned rule so you can hunt for related samples across a corpus/fleet.
+Read-only.
+
+WHEN TO USE: after triaging a malware sample, to pivot from "this one file" to "every file like
+it". Feed the rule to `yara -r rule.yar /path` or a threat-intel platform.
+INPUT: file (the sample), name (optional rule name), min/count (string selection tuning).
+OUTPUT: "## rule" — a ready YARA rule (meta with sha256, strings, condition = magic + filesize +
+N-of-strings).
+INTERPRET/NEXT: review the chosen strings — drop any that are too generic (library boilerplate)
+to avoid false positives, or raise `min`. Test it against a clean corpus first. Tighten the
+condition (raise N, add offsets) if it over-matches.
+FAILURE: few strings on a packed sample -> unpack first (see the triage tool), then generate.
+"""
+
+EXPLOIT_ADVISOR = """\
+Static triage that turns a binary into a PRIORITIZED ACTION PLAN: which vulnerability class is
+likely, why, and which tool in this kit to run next. The "I have a binary — now what?" reasoner
+that bootstraps an autonomous workflow. Read-only (reasons over static analysis; runs nothing).
+
+WHEN TO USE: first look at any unknown/target binary, to decide where to spend effort.
+INPUT: file — the binary.
+OUTPUT: type/entropy/sha256 then "## ACTION PLAN" — ranked items, each with title (vuln class +
+the sink), why, and `next:` (the tool to run: decompile / pwn_template / symbolic / bindiff / disasm).
+INTERPRET/NEXT: work the HIGH items first and run the suggested tool. E.g. "command injection via
+system()" -> decompile to see if the arg is user-controlled; "stack overflow via gets()" ->
+pwn_template; "packed (high entropy)" -> unpack then re-run. This tool DECIDES the plan; the named
+tools EXECUTE it.
+FAILURE: "no obvious sinks" is itself guidance (read main / try symbolic). Packed binaries need
+unpacking before the plan is meaningful.
+"""
+
+PLAYBOOK = """\
+Run a full first-pass recon PLAYBOOK on a domain in one call: enumerate subdomains -> probe them
+over HTTP(S) -> rank the live hosts by how interesting they look -> mine the apex's JavaScript for
+endpoints/secrets. Gives an autonomous operator one prioritized picture instead of five manual
+steps. Read-only recon.
+
+WHEN TO USE: the FIRST thing to run on a new domain target. It orchestrates enum_subdomains,
+http_probe, and js_recon and ranks the output.
+INPUT: domain — the apex.
+OUTPUT: "## PRIORITIZED TARGETS" — each "[score] url [status] title" with reasons (auth-gated,
+interesting keyword, direct origin, broken origin, tech), highest score first; then the apex JS
+endpoints + any secrets.
+INTERPRET/NEXT: start at the top of the list — high scores are auth gates (401/403), dev/staging/
+admin/vault hosts, and broken origins (possible takeover). Drill into each with tls_audit,
+js_recon (that host), directory brute forcing, or the takeover tool. Any secret from the apex JS
+is an immediate lead.
+FAILURE: few live hosts can mean heavy CDN/WAF or a small footprint; run the individual tools with
+different options. Large domains take a while (enumerates then probes every host).
+"""
+
 LOG_TRIAGE = """\
 Triage an auth or web-server log and surface attacks/anomalies. Parses SSH auth
 logs (sshd) and Apache/Nginx access logs (auto-detected per line) and returns a

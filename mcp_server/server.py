@@ -19,22 +19,34 @@ from __future__ import annotations
 
 import sys
 
+from analyze import exploit_advisor as _exploit_advisor
+from cloud import iam_enum as _iam_enum
+from cloud import s3_hunt as _s3_hunt
 from forensics import log_triage as _log_triage
 from forensics import pcap as _pcap
+from malware import yara_gen as _yara_gen
 from malware import triage as _triage
 from mcp_server import guides
+from reversing import bindiff as _bindiff
 from reversing import decompile as _decompile
 from reversing import disasm as _disasm
 from reversing import firmware as _firmware
+from reversing import gadgets as _gadgets
+from reversing import pwn_template as _pwn_template
+from reversing import symbolic as _symbolic
 from recon import asn as _asn
 from recon import dns_records as _dns_records
 from recon import favicon as _favicon
 from recon import http_probe as _http_probe
+from recon import playbook as _playbook
 from recon import secrets_scan as _secrets_scan
 from recon import subdomains as _subdomains
 from recon import takeover as _takeover
+from web import cors as _cors
+from web import graphql as _graphql
 from web import js_recon as _js_recon
 from web import jwt_audit as _jwt
+from web import oauth as _oauth
 from web import tls_audit as _tls_audit
 
 
@@ -133,6 +145,51 @@ def build_app():
         res = _js_recon.run(target)
         return "\n".join(_js_recon._compact_lines(res, only_secrets))
 
+    @app.tool(description=guides.GRAPHQL)
+    def graphql(url: str) -> str:
+        """Introspect + audit a GraphQL endpoint. See the tool description. Compact text."""
+        return "\n".join(_graphql._compact_lines(_graphql.run(url)))
+
+    @app.tool(description=guides.CORS)
+    def cors(url: str) -> str:
+        """Test a URL for CORS misconfigurations. See the tool description. Compact text."""
+        return "\n".join(_cors._compact_lines(_cors.run(url)))
+
+    @app.tool(description=guides.OAUTH)
+    def oauth(target: str) -> str:
+        """Map an OAuth/OIDC deployment and flag weaknesses. See the tool description. Compact text."""
+        return "\n".join(_oauth._compact_lines(_oauth.run(target)))
+
+    @app.tool(description=guides.S3_HUNT)
+    def s3_hunt(keyword: str = "", bucket: str = "") -> str:
+        """Hunt public S3/GCS/Azure buckets from a keyword (or check one `bucket`).
+        See the tool description. Returns compact text."""
+        return "\n".join(_s3_hunt._compact_lines(_s3_hunt.run(keyword, bucket=bucket)))
+
+    @app.tool(description=guides.IAM_ENUM)
+    def iam_enum(profile: str = "", region: str = "us-east-1") -> str:
+        """Enumerate an AWS identity's read-only permissions (needs AWS creds in env
+        or `profile`). See the tool description. Returns compact text."""
+        return "\n".join(_iam_enum._compact_lines(_iam_enum.run(profile=profile, region=region)))
+
+    @app.tool(description=guides.YARA_GEN)
+    def yara_gen(file: str, name: str = "") -> str:
+        """Generate a YARA rule from a sample for threat hunting. See the tool
+        description. Returns compact text (the rule)."""
+        return "\n".join(_yara_gen._compact_lines(_yara_gen.run(file, name=name)))
+
+    @app.tool(description=guides.EXPLOIT_ADVISOR)
+    def exploit_advisor(file: str) -> str:
+        """Static triage -> prioritized exploitation action plan for a binary. See
+        the tool description. Returns compact text."""
+        return "\n".join(_exploit_advisor._compact_lines(_exploit_advisor.run(file)))
+
+    @app.tool(description=guides.PLAYBOOK)
+    def playbook(domain: str) -> str:
+        """One-call recon: enumerate -> probe -> rank targets -> mine JS. See the
+        tool description. Returns a prioritized target list as compact text."""
+        return "\n".join(_playbook._compact_lines(_playbook.run(domain)))
+
     @app.tool(description=guides.TLS_AUDIT)
     def tls_audit(target: str, version_probe: bool = True) -> str:
         """Audit TLS config + HTTP security headers for host[:port]. See the tool
@@ -177,6 +234,39 @@ def build_app():
         res = _disasm.run(file, mode=mode, target=function, syntax=syntax,
                           raw=raw, arch=arch, base=base, offset=offset)
         return "\n".join(_disasm._compact_lines(res))
+
+    @app.tool(description=guides.BINDIFF)
+    def bindiff(old: str, new: str, context: int = 3, max_funcs: int = 50) -> str:
+        """Diff two binaries function-by-function to find a security patch. See the
+        tool description for reading the diffs. Returns compact text."""
+        res = _bindiff.run(old, new, context=context, max_funcs=max_funcs)
+        return "\n".join(_bindiff._compact_lines(res))
+
+    @app.tool(description=guides.PWN_TEMPLATE)
+    def pwn_template(binary: str, host: str = "", port: int = 0) -> str:
+        """Generate a pwntools exploit skeleton from an ELF (protections + strategy +
+        script). See the tool description for the strategies. Returns compact text."""
+        info = _pwn_template.analyze(binary)
+        script = _pwn_template.generate_script(info, host=host, port=port)
+        return "\n".join(_pwn_template._compact_lines(info, script))
+
+    @app.tool(description=guides.GADGETS)
+    def gadgets(file: str, search: str = "", all: bool = False, max_insns: int = 5,
+                raw: bool = False, arch: str = "x86-64", base: int = 0x400000) -> str:
+        """Find & categorize ROP/JOP gadgets. Use `search` (regex) to find specific
+        ones (e.g. "pop rdi"). See the tool description for chain-building. Compact text."""
+        res = _gadgets.run(file, raw=raw, arch=arch, base=base, max_insns=max_insns,
+                           search=search)
+        return "\n".join(_gadgets._compact_lines(res, all))
+
+    @app.tool(description=guides.SYMBOLIC)
+    def symbolic(binary: str, find: str, avoid: str = "", argv: bool = False,
+                 input_size: int = 32, max_steps: int = 300) -> str:
+        """Solve for input that reaches `find` (address or stdout string) via angr.
+        Set argv=true for argv[1] input. See the tool description. Returns compact text."""
+        res = _symbolic.run(binary, find=find, avoid=avoid, argv=argv,
+                            input_size=input_size, max_steps=max_steps)
+        return "\n".join(_symbolic._compact_lines(res))
 
     @app.tool(description=guides.FIRMWARE)
     def firmware(file: str, extract: bool = False, recursive: bool = False) -> str:

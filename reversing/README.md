@@ -51,3 +51,41 @@ The AI reads pseudo-C and assembly well; these tools feed it the raw material.
 
   Requires `binwalk` (+ extractors like `squashfs-tools`, `jefferson`) and
   `objdump` (binutils). `capstone` (pip) is only needed for `disasm --raw`.
+
+- **[gadgets.py](gadgets.py)** — find & **categorize** ROP/JOP gadgets for exploit
+  dev (register-control, syscall, stack-pivot, mem-write), self-contained on
+  `capstone` (no ropper). `--search` greps for a specific gadget.
+
+  ```bash
+  python -m reversing.gadgets ./target --search "pop rdi"
+  python -m reversing.gadgets ./libc.so.6 --all --json
+  ```
+
+- **[symbolic.py](symbolic.py)** — solve for program input with **angr** symbolic
+  execution: find the input that reaches an address or prints a success string.
+  Crushes crackmes/keychecks. Delivers input via stdin (default) or `--argv`.
+
+  ```bash
+  python -m reversing.symbolic ./crackme --find "Correct"
+  python -m reversing.symbolic ./crackme --argv --find 0x401337 --avoid "denied"
+  ```
+
+  `gadgets` needs `capstone`; `symbolic` needs `angr` (heavy; `pip install angr`).
+
+- **[bindiff.py](bindiff.py)** — function-level diff of two binaries to pinpoint a
+  security patch (**1-day analysis**). Matches functions by name, compares normalized
+  disassembly (addresses masked), and shows the instruction diff of each change.
+  Needs `objdump`.
+
+  ```bash
+  python -m reversing.bindiff ./app-1.0 ./app-1.1
+  ```
+
+- **[pwn_template.py](pwn_template.py)** — generate a runnable **pwntools exploit
+  skeleton** from an ELF: reads protections (NX/PIE/RELRO/canary), picks a strategy
+  (ret2win / ret2system / ret2libc / shellcode), and emits the script with a cyclic
+  offset-finder. The generated script needs `pwntools`.
+
+  ```bash
+  python -m reversing.pwn_template ./vuln --host target.io --port 1337
+  ```

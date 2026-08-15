@@ -46,6 +46,7 @@ request to the target host (`tls_audit`). DNS lookups still use the DoH resolver
 | `analyzeHeadless` (Ghidra) | `reversing/decompile.py` | `apt install ghidra` | Headless decompiler at `/usr/share/ghidra/support/analyzeHeadless`. Uses a bundled **Java** GhidraScript (no PyGhidra). Set `GHIDRA_HEADLESS` to override. |
 | `objdump` (binutils) | `reversing/disasm.py` | preinstalled | Per-function disassembly. |
 | `binwalk` (+ extractors) | `reversing/firmware.py` | `apt install binwalk squashfs-tools jefferson` | Firmware scan/extract. Extraction needs the extractor for each filesystem type. |
+| `angr` (pip) | `reversing/symbolic.py` | `pip install angr` | Symbolic-execution solver. Heavy; runs the target in its own emulator. |
 
 Planned tools will additionally wrap common Kali/RE tooling already on the box:
 `strings`, `xxd`/`hexdump`, `strace`, `ltrace`, `file`, `grep`, `tmux`. Each is
