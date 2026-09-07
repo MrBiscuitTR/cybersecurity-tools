@@ -31,6 +31,7 @@ from forensics import pcap as _pcap
 from malware import yara_gen as _yara_gen
 from malware import triage as _triage
 from mcp_server import guides
+from mcp_server import guides_osint
 from reversing import bindiff as _bindiff
 from reversing import decompile as _decompile
 from reversing import disasm as _disasm
@@ -38,6 +39,15 @@ from reversing import firmware as _firmware
 from reversing import gadgets as _gadgets
 from reversing import pwn_template as _pwn_template
 from reversing import symbolic as _symbolic
+from osint import email as _osint_email
+from osint import linkedin as _linkedin
+from osint import person as _person
+from osint import profile as _osint_profile
+from osint import records as _records
+from osint import username as _osint_username
+from osint import variants as _variants
+from osint import vehicle as _vehicle
+from osint import websearch as _websearch
 from recon import asn as _asn
 from recon import dns_records as _dns_records
 from recon import favicon as _favicon
@@ -390,6 +400,105 @@ def build_app(host: str = "127.0.0.1", port: int = 8091, path: str = "/mcp"):
         secs = [s.strip() for s in sections.split(",")] if sections else None
         res = _pcap.run(file, sections=secs, tshark=ts)
         return "\n".join(_pcap._compact_lines(res))
+
+    # --- osint: person-centric investigation --------------------------------
+    # Every tool returns its INTERMEDIATE data as well as its conclusion, so the
+    # model can adjust one input and re-run one step instead of restarting.
+
+    @app.tool(description=guides_osint.WORKFLOW)
+    def osint_workflow() -> str:
+        """How the osint tools chain together, what the model must do itself, and
+        how to report confidence honestly. Read before using the others."""
+        return guides_osint.WORKFLOW
+
+    @app.tool(description=guides_osint.VARIANTS)
+    def osint_variants(name: str = "", handle: str = "", email_domain: str = "",
+                       limit: int = 60) -> str:
+        """Expand name parts into handle/email candidates (offline, instant).
+        Does NOT guess how to split a run-together handle — read it yourself and
+        pass the parts as `name`. Returns compact text."""
+        res = _variants.run(name=name, handle=handle, email_domain=email_domain,
+                            limit=limit)
+        return "\n".join(_variants._compact_lines(res))
+
+    @app.tool(description=guides_osint.USERNAME)
+    def osint_username(usernames: list[str], category: str = "",
+                       control: bool = True) -> str:
+        """Sweep one or MANY handles across ~70 platforms. Pass the whole
+        candidate list at once. Keep control=True — it is what makes the FOUND
+        list trustworthy. Returns compact text."""
+        cats = [c.strip() for c in category.split(",") if c.strip()] or None
+        res = _osint_username.run(usernames, categories=cats, control=control)
+        return "\n".join(_osint_username._compact_lines(res))
+
+    @app.tool(description=guides_osint.PROFILE)
+    def osint_profile(url: str, render: bool = False) -> str:
+        """Extract name/bio/location/employer/education/emails and every linked
+        account from a profile page. rel=me links are self-declared evidence.
+        Returns compact text."""
+        res = _osint_profile.run(url, render=render)
+        return "\n".join(_osint_profile._compact_lines(res))
+
+    @app.tool(description=guides_osint.EMAIL)
+    def osint_email(address: str, skip: str = "") -> str:
+        """Identity, breach exposure and web presence for an email address, from
+        ~10 sources at once. `skip` takes identity/breaches/search/dns.
+        Returns compact text."""
+        res = _osint_email.run(address,
+                               skip=tuple(s.strip() for s in skip.split(",") if s.strip()))
+        return "\n".join(_osint_email._compact_lines(res))
+
+    @app.tool(description=guides_osint.WEBSEARCH)
+    def osint_websearch(query: str = "", person: str = "", handle: str = "",
+                        extra: str = "", max_queries: int = 10) -> str:
+        """Query up to 12 engines and merge by agreement. Use `person` to run the
+        social dork set (the only way to cover Instagram/Facebook/Reddit), and
+        `extra` to disambiguate a common name. Returns compact text."""
+        res = _websearch.run(query, person=person, handle=handle, extra=extra,
+                             max_queries=max_queries)
+        return "\n".join(_websearch._compact_lines(res))
+
+    @app.tool(description=guides_osint.LINKEDIN)
+    def osint_linkedin(target: str = "", discover: str = "", company: str = "",
+                       location: str = "") -> str:
+        """Parse a public LinkedIn profile (`target`), or find one by name
+        (`discover`). HTTP 999 means rate-limited, NOT absent. Compact text."""
+        if discover:
+            res = _linkedin.discover(discover, company=company, location=location)
+        else:
+            res = _linkedin.lookup(target)
+        return "\n".join(_linkedin._compact_lines(res))
+
+    @app.tool(description=guides_osint.RECORDS)
+    def osint_records(query: str, kind: str = "auto") -> str:
+        """Public registers: Wikidata (DoB/education/employers/declared handles),
+        Wikipedia, SEC EDGAR, GLEIF, and keyed registries. An empty result is
+        normal for a private individual. Returns compact text."""
+        return "\n".join(_records._compact_lines(_records.run(query, kind=kind)))
+
+    @app.tool(description=guides_osint.VEHICLE)
+    def osint_vehicle(vin: str = "", plate: str = "", country: str = "auto",
+                      make: str = "", model: str = "", year: int = 0) -> str:
+        """Decode a VIN (NHTSA) or a plate's region/registration date. Plate ->
+        owner is NOT available anywhere lawfully; the result explains the lawful
+        routes. Returns compact text."""
+        res = _vehicle.run(vin=vin, plate=plate, country=country, make=make,
+                           model=model, year=year)
+        return "\n".join(_vehicle._compact_lines(res))
+
+    @app.tool(description=guides_osint.PERSON)
+    def osint_person(name: str = "", handles: list[str] | None = None,
+                     emails: list[str] | None = None, email_domain: str = "",
+                     location: str = "", employer: str = "",
+                     stages: str = "") -> str:
+        """Run every osint tool on one person and correlate the results into
+        confidence-scored accounts with explicit evidence. Pass `stages` to
+        re-run part of the loop cheaply. Returns compact text."""
+        st = tuple(s.strip() for s in stages.split(",") if s.strip()) or _person.STAGES
+        res = _person.run(name=name, handles=handles or [], emails=emails or [],
+                          email_domain=email_domain, location=location,
+                          employer=employer, stages=st)
+        return "\n".join(_person._compact_lines(res))
 
     return app
 
