@@ -79,6 +79,17 @@ and merged by cross-engine agreement.
 | OpenCorporates | `https://api.opencorporates.com/v0.4/officers/search` | `OPENCORPORATES_API_KEY` |
 | OpenSanctions | `https://api.opensanctions.org/search/default` | `OPENSANCTIONS_API_KEY` |
 
+**GitHub** (`osint/github.py`)
+
+| Source | Endpoint | Notes |
+| --- | --- | --- |
+| Users API | `https://api.github.com/users/<login>` | name, bio, company, location, blog, X handle, join date |
+| Repos + commits | `.../users/<login>/repos`, `.../repos/<full>/commits` | **author email from public commit metadata** — usually the only place a developer's real address is published. Bot/CI identities are filtered. `ID+login@users.noreply.github.com` is a proxy, not a mailbox, but the numeric id is a permanent account identifier. |
+| Orgs | `.../users/<login>/orgs` | public org membership |
+
+60 requests/hour unauthenticated; `GITHUB_TOKEN` raises it to 5000/hour and is
+the single most valuable key for this package.
+
 **Domain infrastructure** (`osint/infra.py`) — wraps `recon/` and `web/`, adds RDAP.
 
 | Source | Endpoint | Notes |
@@ -135,6 +146,8 @@ request to the target host (`tls_audit`). DNS lookups still use the DoH resolver
 | `ripgrep` (rg) | `analyze/bughunt.py`, ad-hoc via `common/safe_bash.py` | `apt install ripgrep` | Fast code search for the vuln sweep. |
 | `git` | `analyze/bughunt.py` (clone), `common/safe_bash.py` | preinstalled | Shallow-clones target repos. |
 | `nuclei` | `recon/nuclei.py` | `apt install nuclei` | Template scanner; run `nuclei -update-templates` once. |
+| `pdftotext`, `pdftoppm` (poppler-utils) | `osint/pdf.py` | `apt install poppler-utils` | **Optional.** Best-quality PDF text (resolves font encodings/ToUnicode CMaps) and page rendering for OCR. A stdlib parser is used when absent. |
+| `tesseract` | `osint/pdf.py` | `apt install tesseract-ocr` (+ language packs, e.g. `tesseract-ocr-tur`) | **Optional.** OCR for PDFs with no text layer — scans and exported images, which are otherwise unreadable. |
 
 Planned tools will additionally wrap common Kali/RE tooling already on the box:
 `strings`, `xxd`/`hexdump`, `strace`, `ltrace`, `file`, `grep`, `tmux`. Each is

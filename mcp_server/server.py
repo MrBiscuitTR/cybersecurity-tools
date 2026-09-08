@@ -41,8 +41,10 @@ from reversing import pwn_template as _pwn_template
 from reversing import symbolic as _symbolic
 from osint import contacts as _contacts
 from osint import email as _osint_email
+from osint import github as _gh
 from osint import infra as _infra
 from osint import linkedin as _linkedin
+from osint import pdf as _pdf
 from osint import person as _person
 from osint import profile as _osint_profile
 from osint import records as _records
@@ -521,6 +523,22 @@ def build_app(host: str = "127.0.0.1", port: int = 8091, path: str = "/mcp"):
         Passive unless active=true (which connects to the host). Compact text."""
         res = _infra.run(domain, active=active, subdomains=subdomains)
         return "\n".join(_infra._compact_lines(res))
+
+    @app.tool(description=guides_osint.GITHUB)
+    def osint_github(login: str, max_repos: int = 8) -> str:
+        """GitHub account -> profile fields plus the author email addresses in
+        public commit metadata. The richest single source for a developer.
+        Returns compact text."""
+        return "\n".join(_gh._compact_lines(_gh.run(login, max_repos=max_repos)))
+
+    @app.tool(description=guides_osint.PDF)
+    def osint_pdf(source: str, ocr: bool = False, lang: str = "eng",
+                  region: str = "") -> str:
+        """PDF (path or URL) -> text plus the emails, phones and addresses in it.
+        has_text_layer=false means it is a scan: pass ocr=true to read it.
+        Returns compact text."""
+        res = _pdf.run(source, ocr=ocr, lang=lang, region=region)
+        return "\n".join(_pdf._compact_lines(res))
 
     return app
 

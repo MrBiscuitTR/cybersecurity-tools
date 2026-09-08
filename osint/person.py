@@ -70,8 +70,8 @@ import urllib.parse as up
 from common.output import emit, log
 from osint import fetch, variants
 
-STAGES = ("seed", "username", "email", "search", "linkedin", "records",
-          "profile", "infra", "correlate")
+STAGES = ("seed", "username", "email", "search", "sites", "linkedin", "records",
+          "profile", "github", "infra", "correlate")
 
 # Hosts that are platforms rather than somebody's own site. Derived from the
 # username platform table instead of hand-maintained: a hardcoded list silently
@@ -112,7 +112,14 @@ def _norm_name(text: str) -> str:
 
 
 def _name_tokens(text: str) -> set[str]:
-    return {t for t in re.split(r"[^a-z]+", (text or "").lower()) if len(t) > 2}
+    """Comparable word tokens, ASCII-folded first.
+
+    Without the fold, "Çağan Çalıdağ" splits on every non-ASCII letter and
+    produces nothing that matches "cagan calidag" — so the person's own site
+    fails to match their own name.
+    """
+    folded = variants._ascii_fold(text or "").lower()
+    return {t for t in re.split(r"[^a-z0-9]+", folded) if len(t) > 2}
 
 
 def looks_like_a_person_name(value: str, *, min_words: int = 2) -> bool:
@@ -223,6 +230,89 @@ def _score_account(
     return conf, score, why
 
 
+# TLDs a person actually puts a personal site on, cheapest-first.
+PERSONAL_TLDS = ("com", "net", "dev", "io", "me", "org", "co", "xyz", "site",
+                 "tech", "page", "app", "blog", "info", "fr", "com.tr")
+
+
+def personal_site_candidates(handles: list[str], name: str = "",
+                             *, limit: int = 24) -> list[str]:
+    """Domains a person with these handles plausibly owns.
+
+    Search engines are unreliable for finding somebody's own site — it has no
+    inbound links and ranks below every scraper that mentions the name. But the
+    domain is almost always just the handle plus a common TLD, and checking that
+    directly costs one DNS lookup each. ``cagancalidag`` -> ``cagancalidag.com``.
+
+    Args:
+        handles: Candidate handles, best first.
+        name: Full name, contributing its concatenated form.
+        limit: Cap on generated domains.
+
+    Returns:
+        Candidate domains, most-likely first, de-duplicated.
+    """
+    bases: list[str] = []
+    for h in handles:
+        core = re.sub(r"[^a-z0-9-]", "", h.lower())
+        if 3 <= len(core) <= 40 and core not in bases:
+            bases.append(core)
+    if name:
+        joined = re.sub(r"[^a-z0-9]", "", variants._ascii_fold(name).lower())
+        if 3 <= len(joined) <= 40 and joined not in bases:
+            bases.insert(0, joined)
+
+    out: list[str] = []
+    for base in bases[:6]:
+        for tld in PERSONAL_TLDS:
+            d = f"{base}.{tld}"
+            if d not in out:
+                out.append(d)
+    return out[:limit]
+
+
+def verify_personal_site(domain: str, *, name: str, handles: list[str],
+                         timeout: float = 8.0) -> dict | None:
+    """Fetch a candidate domain and decide whether it is really the target's.
+
+    Existence is not enough — parked pages, squatters and unrelated companies
+    all answer 200. The page must actually NAME the person (or carry a handle we
+    already believe in), which is exactly the "title, description or JSON-LD
+    match" test rather than a guess from the domain string.
+
+    Returns:
+        ``{"domain","url","matched_on","identity"}`` or None.
+    """
+    from osint import profile as profile_mod
+    r = fetch.get(f"https://{domain}", timeout=timeout, retries=0)
+    if not r.ok or r.blocked or len(r.body) < 200:
+        return None
+    data = profile_mod.extract(r.text, base_url=r.final_url)
+    ident = data.get("identity", {}) or {}
+    og = data.get("opengraph", {}) or {}
+
+    haystacks = {
+        "json-ld name": ident.get("name", ""),
+        "page title": data.get("title", ""),
+        "og:title": og.get("og:title", ""),
+        "meta description": og.get("og:description", "") or og.get("description", ""),
+        "meta author": og.get("author", ""),
+        "page text": data.get("text_sample", "")[:600],
+    }
+    want = _name_tokens(name) if name else set()
+    for where, hay in haystacks.items():
+        if not hay:
+            continue
+        if want and len(want & _name_tokens(hay)) >= min(2, len(want)):
+            return {"domain": domain, "url": r.final_url, "matched_on": where,
+                    "identity": ident, "profile": data}
+        if any(h.lower() in hay.lower() for h in handles if len(h) > 5):
+            return {"domain": domain, "url": r.final_url,
+                    "matched_on": f"{where} (handle)", "identity": ident,
+                    "profile": data}
+    return None
+
+
 def _extract_batch(urls: list[str], *, timeout: float, region: str,
                    workers: int = 6) -> tuple[list[dict], dict[str, str]]:
     """Run osint.profile over a list of URLs concurrently."""
@@ -304,7 +394,8 @@ def run(
                             "emails": known_emails, "location": location,
                             "employer": employer, "region": region},
                  "stages_run": [], "seed": {}, "username": {}, "email": {},
-                 "search": {}, "linkedin": {}, "records": {}, "profiles": [],
+                 "search": {}, "sites": [], "linkedin": {}, "records": {},
+                 "profiles": [], "github": [],
                  "infra": [], "accounts": [], "identity": {}, "entities": {},
                  "name_refinement": [], "next_steps": []}
 
@@ -428,6 +519,41 @@ def run(
                 cands.append((got, f"search result for {host}"))
         refine_name(cands)
 
+    # --- sites: the subject's own website -----------------------------------
+    # Run before linkedin/records so a discovered personal site can correct the
+    # name and seed those stages properly. A personal site is the single richest
+    # page in a person investigation: it is written by them, it names their
+    # accounts with rel=me, and search engines routinely fail to surface it.
+    if "sites" in stages and (sweep_handles or name):
+        cands = personal_site_candidates(sweep_handles, name)
+        log(f"[*] stage sites: probing {len(cands)} handle-derived domain(s) ...")
+        probes = {d: (lambda dom=d: verify_personal_site(
+            dom, name=name, handles=sweep_handles, timeout=min(timeout, 8.0)))
+            for d in cands}
+        got, _ = fetch.gather(probes, workers=10, timeout=timeout * 3)
+        out["sites"] = list(got.values())
+        for s in out["sites"]:
+            log(f"[*] personal site: {s['url']} (matched on {s['matched_on']})")
+        # The landing page rarely holds the contact details; /contact, /about,
+        # /impressum and a linked CV PDF do. Crawl those.
+        if out["sites"]:
+            from osint import profile as profile_mod
+            harvests, _ = fetch.gather(
+                {s["url"]: (lambda u=s["url"]: profile_mod.harvest_site(
+                    u, timeout=timeout, region=region))
+                 for s in out["sites"]}, workers=3, timeout=timeout * 4)
+            for s in out["sites"]:
+                h = harvests.get(s["url"])
+                if h:
+                    s["harvest"] = h
+                    for e in h.get("emails", []):
+                        if e not in known_emails:
+                            known_emails.append(e)
+                            log(f"[*] site contact email: {e}")
+        out["stages_run"].append("sites")
+        refine_name([((s["identity"] or {}).get("name", ""), s["url"])
+                     for s in out["sites"]])
+
     # --- linkedin -----------------------------------------------------------
     if "linkedin" in stages and name:
         from osint import linkedin
@@ -462,6 +588,8 @@ def run(
                 seen_urls.add(key)
                 urls.append(u)
 
+        for s in out.get("sites") or []:      # richest pages first
+            add(s["url"])
         for hit in (out.get("username") or {}).get("found", []):
             add(hit["url"])
         for lst in ((out.get("search") or {}).get("by_platform") or {}).values():
@@ -476,12 +604,20 @@ def run(
                 add(u.get("url", ""))
         for site in (out.get("records") or {}).get("person", {}).get("website", []) or []:
             add(site)
-        # Personal sites from generic search results are the richest hubs.
-        for r in (out.get("search") or {}).get("results", [])[:40]:
+        # Search results that are plausibly the subject's own site. The domain
+        # matching the name is the strongest signal, but a result whose TITLE or
+        # DESCRIPTION carries the full name is worth fetching too — that is how
+        # you find a personal site on a domain that isn't the handle.
+        want = _name_tokens(name) if name else set()
+        for r in (out.get("search") or {}).get("results", [])[:60]:
             host = _host_of(r["url"])
-            if host and not _is_platform_host(host) and name:
-                if _name_tokens(name) & _name_tokens(host.replace(".", " ")):
-                    add(r["url"])
+            if not host or _is_platform_host(host) or not want:
+                continue
+            if want & _name_tokens(host.replace(".", " ")):
+                add(r["url"])                      # domain contains the name
+            elif len(want & _name_tokens(f"{r.get('title', '')} "
+                                         f"{r.get('snippet', '')}")) >= len(want):
+                add(r["url"])                      # title/description names them
         return urls
 
     # --- profile (with name refinement and recursive expansion) -------------
@@ -532,8 +668,42 @@ def run(
             queue = nxt[:max_profiles]
         out["stages_run"].append("profile")
 
+    # --- github ---------------------------------------------------------------
+    # Public commit metadata carries the author's configured email address. For
+    # anyone who writes code this is usually the only place a real address is
+    # published, so it is worth a dedicated stage rather than a page scrape.
+    if "github" in stages:
+        logins: list[str] = []
+        for hit in (out.get("username") or {}).get("found", []):
+            if hit["site"] == "github" and hit["username"] not in logins:
+                logins.append(hit["username"])
+        for p in out["profiles"] + [{"rel_me": s.get("profile", {}).get("rel_me", []),
+                                     "links": []} for s in (out.get("sites") or [])]:
+            for l in p.get("rel_me", []) + p.get("links", []):
+                if l.get("platform") == "github" and l.get("handle") not in logins:
+                    logins.append(l["handle"])
+        for s in out.get("sites") or []:
+            for l in (s.get("profile") or {}).get("rel_me", []):
+                if l.get("platform") == "github" and l.get("handle") not in logins:
+                    logins.append(l["handle"])
+        if logins:
+            from osint import github as gh
+            log(f"[*] stage github: {', '.join(logins[:3])}")
+            got, _ = fetch.gather(
+                {g: (lambda login=g: gh.run(login, timeout=timeout))
+                 for g in logins[:3]}, workers=3, timeout=timeout * 4)
+            out["github"] = list(got.values())
+            for g in out["github"]:
+                for e in g.get("emails", []):
+                    if e["kind"] == "real" and e["email"] not in known_emails:
+                        known_emails.append(e["email"])
+                        log(f"[*] github commit email: {e['email']}")
+            refine_name([((g.get("profile") or {}).get("name", ""),
+                          f"github/{g['login']} profile") for g in out["github"]])
+        out["stages_run"].append("github")
+
     # --- infra --------------------------------------------------------------
-    domains: list[str] = []
+    domains: list[str] = [s["domain"] for s in (out.get("sites") or [])]
     for p in out["profiles"]:
         host = _host_of(p["url"])
         if host and not _is_platform_host(host):
@@ -549,9 +719,10 @@ def run(
     if "infra" in stages and domains:
         from osint import infra as infra_mod
         log(f"[*] stage infra: profiling {len(domains[:5])} domain(s) ...")
-        sources = {d: (lambda dom=d: infra_mod.run(dom, active=active_infra,
-                                                   timeout=timeout))
-                   for d in domains[:5]}
+        personal = {s["domain"] for s in (out.get("sites") or [])}
+        sources = {d: (lambda dom=d: infra_mod.run(
+            dom, active=active_infra, subdomains=dom in personal, timeout=timeout))
+            for d in domains[:5]}
         got, _ = fetch.gather(sources, workers=3, timeout=timeout * 5)
         out["infra"] = list(got.values())
         out["stages_run"].append("infra")
@@ -651,6 +822,17 @@ def run(
                     vals.append({"value": value, "sources": [src]})
             return sorted(vals, key=lambda x: -len(x["sources"]))
 
+        def _employers() -> list[str]:
+            names = ([e["name"] for e in
+                      (out.get("linkedin") or {}).get("parsed", {})
+                      .get("experience", [])]
+                     + ((out.get("records") or {}).get("person", {})
+                        .get("employer") or [])
+                     + [(g.get("profile") or {}).get("company", "")
+                        for g in out.get("github", [])])
+            return [n.strip() for n in dict.fromkeys(names) if n and n.strip()]
+
+        employers = _employers()
         li_parsed = (out.get("linkedin") or {}).get("parsed", {})
         li_ident = li_parsed.get("identity", {})
         rec_person = (out.get("records") or {}).get("person", {})
@@ -659,6 +841,10 @@ def run(
                       for p in out["profiles"]]
         name_pairs += [(h.get("profile_name", ""), f"{h['site']} metadata")
                        for h in (out.get("username") or {}).get("found", [])]
+        name_pairs += [((g.get("profile") or {}).get("name", ""),
+                        f"github/{g['login']}") for g in out.get("github", [])]
+        name_pairs += [(s.get("identity", {}).get("name", ""), s["url"])
+                       for s in (out.get("sites") or [])]
         name_pairs += [(li_ident.get("name", ""), "linkedin"),
                        (rec_person.get("name", ""), "wikidata")]
         for addr, data in (out.get("email") or {}).items():
@@ -675,6 +861,8 @@ def run(
         loc_pairs = [((p["identity"] or {}).get("locality", ""), p["url"])
                      for p in out["profiles"]]
         loc_pairs += [(li_ident.get("locality", ""), "linkedin")]
+        loc_pairs += [((g.get("profile") or {}).get("location", ""),
+                       f"github/{g['login']}") for g in out.get("github", [])]
         for addr, data in (out.get("email") or {}).items():
             loc_pairs.append(((data.get("identity", {}) or {}).get("location", ""),
                               f"gravatar/{addr}"))
@@ -695,18 +883,42 @@ def run(
             text = " ".join(str(v) for v in (page["identity"] or {}).values())
             return bool(name and _name_tokens(name) & _name_tokens(text))
 
-        on_target = [p for p in out["profiles"] if about_target(p)]
+        # A verified personal site and a GitHub account are on-target by
+        # construction: the first was matched against the name, the second was
+        # reached from a self-declared link or an exact handle hit.
+        site_pages = [{"url": s["url"], "identity": s.get("identity", {}),
+                       **(s.get("harvest") or {})} for s in (out.get("sites") or [])]
+        on_target = [p for p in out["profiles"] if about_target(p)] + site_pages
 
         phones = merged([(ph["e164"], p["url"]) for p in on_target
-                         for ph in p["phones"]])
+                         for ph in p.get("phones", [])])
         for ph in phones:
-            src = next((x for p in out["profiles"] for x in p["phones"]
+            src = next((x for p in on_target for x in p.get("phones", [])
                         if x["e164"] == ph["value"]), {})
             ph["country"] = src.get("country", "")
             ph["confidence"] = src.get("confidence", "")
         addresses = merged([(a["formatted"], p["url"]) for p in on_target
-                            for a in p["addresses"]])
-        interests = merged([(i, p["url"]) for p in on_target for i in p["interests"]])
+                            for a in p.get("addresses", [])])
+        # A page's keyword list repeats the person's own name and its language
+        # codes ("en", "tr", "fr"); neither is an interest.
+        own_tokens = _name_tokens(name)
+
+        def is_interest(value: str) -> bool:
+            v = value.strip()
+            if len(v) < 3 or v.isdigit():
+                return False
+            if own_tokens and _name_tokens(v) and _name_tokens(v) <= own_tokens:
+                return False
+            if v.lower() in {h.lower() for h in sweep_handles}:
+                return False          # a handle is an identifier, not an interest
+            return v.lower() not in {"en", "tr", "fr", "de", "es", "it", "nl",
+                                     "pt", "ru", "ar", "zh", "ja", "portfolio"}
+
+        interests = merged(
+            [(i, p["url"]) for p in on_target for i in p.get("interests", [])
+             if is_interest(i)]
+            + [(topic, f"github/{g['login']}") for g in out.get("github", [])
+               for topic in g.get("topics", []) if is_interest(topic)])
 
         out["identity"] = {
             "names": aliases,
@@ -716,16 +928,17 @@ def run(
                                  for p in out["profiles"]]
                                 + [(li_ident.get("headline", ""), "linkedin")]),
             "birth_date": rec_person.get("birth_date") or [],
-            "birth_hints": sorted({b for p in on_target for b in p["birth_hints"]
+            "birth_hints": sorted({b for p in on_target
+                                   for b in p.get("birth_hints", [])
                                    if _plausible_birth(b)}),
-            "employers": list(dict.fromkeys(
-                [e["name"] for e in li_parsed.get("experience", [])]
-                + (rec_person.get("employer") or []))),
+            "employers": employers,
             "education": list(dict.fromkeys(
                 [e["name"] for e in li_parsed.get("education", [])]
                 + (rec_person.get("educated_at") or []))),
-            "emails": sorted({e for p in on_target for e in p["emails"]}
-                             | set(known_emails)),
+            "emails": sorted({e for p in on_target for e in p.get("emails", [])}
+                             | set(known_emails)
+                             | {e["email"] for g in out.get("github", [])
+                                for e in g.get("emails", []) if e["kind"] == "real"}),
             "phones": phones,
             "addresses": addresses,
             "interests": interests,
@@ -786,7 +999,8 @@ def run(
     if domains and "infra" not in out["stages_run"]:
         steps.append(f"Domains found ({', '.join(domains[:3])}) — add the infra "
                      "stage for RDAP/DNS/ASN/tech.")
-    if not out["accounts"]:
+    if not out["accounts"] and not (out["identity"].get("names")
+                                    or out["identity"].get("emails")):
         steps.append("Nothing found. Check the name spelling, try a handle you "
                      "already know (--handle), and remember most private people "
                      "have a genuinely small public footprint.")
@@ -842,6 +1056,18 @@ def _result_table(res: dict) -> list[str]:
         add("INTEREST", i["value"])
     for b in ent.get("breach", []):
         add("BREACH", b)
+    for g in res.get("github", []):
+        prof = g.get("profile") or {}
+        add("GITHUB ACCOUNT", prof.get("html_url", ""), f"id {g.get('user_id', '')}")
+        for e in g.get("emails", []):
+            add("EMAIL (git commit)", e["email"],
+                "real address" if e["kind"] == "real" else "noreply proxy")
+        for o in g.get("orgs", []):
+            add("ORGANIZATION", o["login"], "github org")
+    for s in res.get("sites", []):
+        add("WEBSITE", s.get("url", ""), f"matched on {s.get('matched_on', '')}")
+        for pg in (s.get("harvest") or {}).get("pages_fetched", [])[1:]:
+            add("PAGE CRAWLED", pg, "contact/CV page")
     for inf in res.get("infra", []):
         add("DOMAIN", inf.get("domain", ""),
             (inf.get("rdap") or {}).get("registrar", ""))

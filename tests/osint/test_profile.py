@@ -28,7 +28,7 @@ JSONLD_PAGE = """
 <a href="https://twitter.com/ada_l">twitter</a>
 <a href="https://github.com/features/copilot">a product page</a>
 <a href="/about">local nav</a>
-<p>Contact: ada [at] example [dot] com or ada.l@example.com</p>
+<p>Contact: ada [at] lovelace [dot] dev or ada.l@lovelace.dev</p>
 <p>Born 10 December 1815 in London.</p>
 </body></html>
 """
@@ -78,8 +78,8 @@ def test_same_host_links_are_dropped(extracted):
 
 
 def test_emails_including_obfuscated(extracted):
-    assert "ada.l@example.com" in extracted["emails"]
-    assert "ada@example.com" in extracted["emails"]
+    assert "ada.l@lovelace.dev" in extracted["emails"]
+    assert "ada@lovelace.dev" in extracted["emails"]
 
 
 def test_no_email_false_positives_from_the_word_at():
@@ -89,9 +89,9 @@ def test_no_email_false_positives_from_the_word_at():
 
 
 def test_implausible_tlds_rejected():
-    html = "<p>see datasette.example.net. Disclosures follow. real@example.com</p>"
+    html = "<p>see datasette.acme.net. Disclosures follow. real@acme.dev</p>"
     emails = profile.extract(html)["emails"]
-    assert "real@example.com" in emails
+    assert "real@acme.dev" in emails
     assert not any(e.endswith(".disclosures") for e in emails)
 
 
@@ -165,3 +165,75 @@ def test_masked_employers_are_dropped_from_jsonld():
     </script>"""
     orgs = profile.extract(page)["identity"]["works_for"]
     assert [o["name"] for o in orgs] == ["Datasette"]
+
+
+@pytest.mark.parametrize("addr,ok", [
+    ("real.person@acme.dev", True),
+    ("contact@cagancalidag.com", True),
+    ("email@domain.tld", False),          # contact-form placeholder
+    ("your@email.com", False),
+    ("john.doe@example.com", False),
+    ("no-reply@acme.dev", False),
+    ("me@acme.dev", True),
+    ("info@acme.dev", True),
+    ("someone@acme.invalid", False),
+])
+def test_placeholder_emails_rejected(addr, ok):
+    assert profile._plausible_email(addr) is ok
+
+
+def test_decode_cfemail():
+    """Cloudflare's email protection is a one-byte XOR; decoding it is the
+    difference between finding a contact address and reporting none."""
+    token = "93f0fcfde7f2f0e7d3f0f2f4f2fdf0f2fffaf7f2f4bdf0fcfe"
+    assert profile.decode_cfemail(token) == "contact@cagancalidag.com"
+    assert profile.decode_cfemail("zz") == ""
+    assert profile.decode_cfemail("") == ""
+
+
+def test_mailto_and_tel_links_are_captured():
+    html = ('<a href="mailto:me@acme.dev?subject=hi">write</a>'
+            '<a href="tel:+905321234567">call</a>')
+    res = profile.extract(html, region="TR")
+    assert "me@acme.dev" in res["emails"]
+    assert res["phones"][0]["e164"] == "+905321234567"
+    assert res["phones"][0]["confidence"] == "high"
+
+
+def test_cfemail_address_is_extracted():
+    html = ('<a class="__cf_email__" '
+            'data-cfemail="93f0fcfde7f2f0e7d3f0f2f4f2fdf0f2fffaf7f2f4bdf0fcfe">'
+            '[email protected]</a>')
+    assert "contact@cagancalidag.com" in profile.extract(html)["emails"]
+
+
+def test_internal_links_are_recorded_for_crawling():
+    html = ('<a href="/pages/contact.html">Contact</a>'
+            '<a href="/pages/cv.html">CV</a>'
+            '<a href="https://github.com/someone">gh</a>')
+    res = profile.extract(html, base_url="https://acme.dev/")
+    assert "https://acme.dev/pages/contact.html" in res["internal_links"]
+    assert "https://acme.dev/pages/cv.html" in res["internal_links"]
+    assert all("github.com" not in u for u in res["internal_links"])
+
+
+@pytest.mark.parametrize("title,name", [
+    ("Çağan Efe Çalıdağ (@caganefecalidag) on X", "Çağan Efe Çalıdağ"),
+    ("Bill Gates - Gates Foundation | LinkedIn", "Bill Gates"),
+    ("Dan – Medium", "Dan"),
+    ("@onlyahandle", ""),
+])
+def test_clean_title_name(title, name):
+    assert profile.clean_title_name(title) == name
+
+
+
+@pytest.mark.parametrize("url,ok", [
+    ("https://acme.dev/contact", True),
+    ("https://acme.dev/pages/cv.html", True),
+    ("https://acme.dev/impressum", True),
+    ("https://acme.dev/iletisim", True),
+    ("https://acme.dev/blog/post-42", False),
+])
+def test_contact_page_detection(url, ok):
+    assert bool(profile.CONTACT_PAGE_RE.search(url)) is ok

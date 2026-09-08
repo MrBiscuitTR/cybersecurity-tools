@@ -44,11 +44,12 @@ import html
 import json
 import re
 import sys
+import zlib
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from common.output import emit, log
-from osint import contacts, fetch
+from osint import contacts, fetch, pdf
 
 # (host fragment, platform, regex capturing the handle, max path segments).
 # The segment cap is what separates a profile from site furniture:
@@ -156,6 +157,17 @@ _BIRTH_RE = re.compile(
     r"|\d{1,2}[./-]\d{1,2}[./-](?:1[89]|20)\d{2}"
     r"|(?:1[89]|20)\d{2}"
     r")")
+# Site-wide <meta keywords> boilerplate. Every social platform ships the same
+# handful of words on every page; they describe the product, not the person.
+_GENERIC_KEYWORDS = frozenset("""
+social media network profile profiles timeline feed photos videos photo video
+app application website web site online free login signup share sharing friends
+followers following posts post news updates community platform account accounts
+page pages home discover explore trending popular search instagram facebook
+twitter tiktok youtube linkedin threads pinterest snapchat reddit
+""".split()) | {"social media", "social network", "photo sharing",
+                "video sharing", "sign up", "log in", "see more"}
+
 _TAG_RE = re.compile(r"<(script|style)\b.*?</\1>", re.S | re.I)
 _COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
 # Tags whose contents are never identity data. <script> is included here, so
@@ -165,11 +177,67 @@ _NOISE_TAG_RE = re.compile(
     r"picture|object|embed|map|figure)\b[^>]*>.*?</\1\s*>", re.S | re.I)
 
 
+# Addresses that are documentation, not people. A contact form's placeholder
+# ("email@domain.tld") looks exactly like a real find to a regex.
+# Deliberately narrow. "contact@", "info@" and "me@" are real addresses people
+# actually publish — rejecting them loses the very thing a contact page exists
+# to state. Only unambiguous documentation and no-reply mailboxes are dropped.
+_PLACEHOLDER_EMAILS = re.compile(
+    r"(?i)^(?:you|your\w*|username|firstname|lastname|example|sample|demo|"
+    r"foo|bar|john\.?doe|jane\.?doe|email|e-mail|no-?reply|donotreply)@"
+    r"|@(?:example|domain|yourdomain|mydomain|sample|yoursite|website)\."
+    r"|\.(?:tld|invalid|localhost|local|test|example)$")
+_CFEMAIL_RE = re.compile(r'data-cfemail="([0-9a-fA-F]{8,})"')
+
+
+def decode_cfemail(token: str) -> str:
+    """Decode a Cloudflare "email protection" token.
+
+    Cloudflare rewrites addresses on a page into ``data-cfemail="<hex>"`` where
+    the first byte is an XOR key for the rest. It is on a very large share of
+    sites and is trivially reversible — leaving it encoded means missing the
+    contact address on pages that plainly display one.
+
+    Args:
+        token: The hex string from the attribute.
+
+    Returns:
+        The decoded address, or "" if the token is malformed.
+    """
+    try:
+        raw = bytes.fromhex(token)
+    except ValueError:
+        return ""
+    if len(raw) < 2:
+        return ""
+    key = raw[0]
+    return "".join(chr(b ^ key) for b in raw[1:])
+
+
+def clean_title_name(title: str) -> str:
+    """Reduce a page title to the person's name.
+
+    Platforms format profile titles as "Name (@handle) on X",
+    "Name - Company | LinkedIn" or "Name – Medium". Using the raw title as the
+    name puts strings like "Çağan Efe Çalıdağ (@caganefecalidag) on X" into the
+    identity, which then fail to match the real name anywhere else.
+    """
+    name = (title or "").strip()
+    name = re.split(r"\s+[|·•]\s+|\s+[-–—]\s+", name)[0].strip()
+    name = re.sub(r"\s*\(@[^)]*\)\s*", " ", name)
+    name = re.sub(r"\s+on\s+(X|Twitter|Instagram|Threads|Medium|LinkedIn)$", "",
+                  name, flags=re.I)
+    name = name.strip(" -–—|·•")
+    return "" if name.startswith("@") else name
+
+
 def _plausible_email(addr: str) -> bool:
     """Filter regex noise: asset filenames, all-numeric mailboxes, and made-up
     TLDs produced by a sentence boundary ("...example.net. Disclosures")."""
     local, _, domain = addr.partition("@")
     if not local or not domain or local.isdigit():
+        return False
+    if _PLACEHOLDER_EMAILS.search(addr):
         return False
     if re.search(r"\.(png|jpe?g|gif|svg|webp|css|js|ico|woff2?)$", addr, re.I):
         return False
@@ -417,6 +485,9 @@ def extract(page_html: str, base_url: str = "", *, region: str = "") -> dict:
     # separately because it is an explicit, self-declared identity claim.
     links: list[dict] = []
     rel_me: list[dict] = []
+    internal: list[str] = []
+    href_emails: list[str] = []
+    href_phones: list[str] = []
     seen: set[str] = set()
     own_host = urlparse(base_url).netloc.lower().removeprefix("www.") if base_url else ""
     for m in re.finditer(r"<a\b([^>]*)>", page_html, re.I):
@@ -425,12 +496,30 @@ def extract(page_html: str, base_url: str = "", *, region: str = "") -> dict:
         if not href_m:
             continue
         href = html.unescape(href_m.group(1)).strip()
-        if href.startswith("mailto:") or not href or href.startswith("#"):
+        # mailto:/tel: are the most direct contact data a page can carry.
+        # Skipping them (as this used to) discards the one link that states an
+        # address outright, leaving only prose for the regex to guess from.
+        if href.lower().startswith("mailto:"):
+            addr = href[7:].split("?")[0].strip().lower()
+            if addr and addr not in href_emails:
+                href_emails.append(addr)
+            continue
+        if href.lower().startswith("tel:"):
+            num = href[4:].split("?")[0].strip()
+            if num and num not in href_phones:
+                href_phones.append(num)
+            continue
+        if not href or href.startswith(("#", "javascript:", "data:")):
             continue
         full = urljoin(base_url, href) if base_url else href
         # Links back into the page's own site are navigation, not other accounts;
         # we already know which platform we're on.
         if own_host and urlparse(full).netloc.lower().removeprefix("www.") == own_host:
+            # Not another account — but on a personal site these are the
+            # /contact and /cv pages where the contact details actually live,
+            # so they're recorded for a caller that wants to follow them.
+            if full not in internal:
+                internal.append(full)
             continue
         info = classify_link(full)
         if not info or full in seen:
@@ -446,7 +535,10 @@ def extract(page_html: str, base_url: str = "", *, region: str = "") -> dict:
             seen.add(info["url"])
             rel_me.append(info)
 
-    emails = sorted({e for e in (x.lower() for x in _EMAIL_RE.findall(text))
+    # Cloudflare rewrites addresses into data-cfemail tokens; decode them back.
+    cf_emails = [decode_cfemail(tok) for tok in _CFEMAIL_RE.findall(page_html)]
+    emails = sorted({e for e in (x.lower() for x in
+                                 _EMAIL_RE.findall(text) + href_emails + cf_emails)
                      if _plausible_email(e)})
     for local, dom, tld in _OBFUS_RE.findall(text):
         cand = f"{local}@{dom}.{tld}".lower()
@@ -457,7 +549,7 @@ def extract(page_html: str, base_url: str = "", *, region: str = "") -> dict:
                                   region=region)
 
     identity = {
-        "name": person.get("name") or og.get("og:title", "").split(" - ")[0].strip() or h1,
+        "name": person.get("name") or clean_title_name(og.get("og:title", "")) or h1,
         "given_name": person.get("given_name") or og.get("profile:first_name", ""),
         "family_name": person.get("family_name") or og.get("profile:last_name", ""),
         "username": og.get("profile:username", ""),
@@ -486,8 +578,17 @@ def extract(page_html: str, base_url: str = "", *, region: str = "") -> dict:
                 and tag.lower() not in {i.lower() for i in interests}):
             interests.append(tag)
 
+    for raw_num in href_phones:
+        info = contacts.normalize_phone(raw_num, region=region)
+        if info and not any(p["e164"] == info["e164"]
+                            for p in found_contacts["phones"]):
+            found_contacts["phones"].append(
+                {**info, "raw": raw_num, "confidence": "high",
+                 "context": "tel: link on the page"})
+
     return {"identity": {k: v for k, v in identity.items() if v},
             "links": links, "rel_me": rel_me, "emails": emails,
+            "internal_links": internal[:200],
             "phones": found_contacts["phones"],
             "addresses": found_contacts["addresses"],
             "interests": interests,
@@ -628,6 +729,105 @@ def _compact_lines(res: dict) -> list[str]:
         lines.append("## NEXT")
         lines += [f"  - {s}" for s in res["next_steps"]]
     return lines
+
+
+# Pages that carry contact details, in several languages. A personal site keeps
+# its email on /contact or /impressum, never on the landing page.
+CONTACT_PAGE_RE = re.compile(
+    r"(?i)(contact|kontakt|about|impressum|imprint|legal|privacy|datenschutz|"
+    r"cv|resume|curriculum|vitae|bio|team|hire|work-with|reach|"
+    r"iletisim|hakkimda|hakkinda|ozgecmis|"
+    r"contacto|acerca|apropos|a-propos|chi-siamo|contatti)")
+def harvest_site(
+    base_url: str,
+    *,
+    max_pages: int = 8,
+    timeout: float = 12.0,
+    region: str = "",
+    ocr: bool = False,
+) -> dict:
+    """Crawl a person's own site for contact details.
+
+    The landing page almost never carries an address; ``/contact``, ``/about``,
+    ``/impressum`` and a linked CV PDF do. This follows only same-site links
+    whose URL or link text looks contact-related, plus PDFs, to a small bounded
+    page count — enough to find the details, not a site mirror.
+
+    Args:
+        base_url: The site's entry point.
+        max_pages: Hard cap on pages fetched (including the entry point).
+        timeout: Per-request timeout.
+        region: ISO country code for phone/postcode interpretation.
+        ocr: Allow OCR on linked PDFs that have no text layer (needs tesseract).
+
+    Returns:
+        ``{"base","pages_fetched","emails","phones","addresses","links",
+        "rel_me","identity","pdfs"}`` aggregated across the crawl.
+    """
+    base = run(base_url, timeout=timeout, region=region)
+    pages = [base_url]
+    emails = list(base.get("emails", []))
+    phones = list(base.get("phones", []))
+    addresses = list(base.get("addresses", []))
+    links = list(base.get("links", []))
+    rel_me = list(base.get("rel_me", []))
+    pdfs: list[str] = []
+
+    candidates = [u for u in base.get("internal_links", [])
+                  if CONTACT_PAGE_RE.search(u)]
+    candidates += [u for u in base.get("internal_links", [])
+                   if u.lower().endswith(".pdf") and u not in candidates]
+    todo = candidates[:max_pages - 1]
+    if todo:
+        log(f"[*] harvest: following {len(todo)} contact-ish page(s) on "
+            f"{urlparse(base_url).netloc}")
+
+    def fetch_one(url: str) -> dict:
+        r = fetch.get(url, timeout=timeout, retries=0)
+        if not r.ok:
+            return {}
+        if url.lower().endswith(".pdf") or r.body[:5].startswith(b"%PDF"):
+            # A CV or certificate is frequently the only document carrying a
+            # phone number or postal address.
+            doc = pdf.extract(r.body, ocr=ocr)
+            text = doc["text"]
+            if not text:
+                return {}
+            found = contacts.run(text=text, region=region)
+            return {"url": url, "pdf": True, "pdf_method": doc["method"],
+                    "emails": sorted(
+                        {e for e in (x.lower() for x in _EMAIL_RE.findall(text))
+                         if _plausible_email(e)}), **found}
+        data = extract(r.text, base_url=r.final_url, region=region)
+        return {"url": url, "pdf": False, **data}
+
+    got, _ = fetch.gather({u: (lambda url=u: fetch_one(url)) for u in todo},
+                          workers=5, timeout=timeout * 3)
+    for url, data in got.items():
+        pages.append(url)
+        if data.get("pdf"):
+            pdfs.append(url)
+        for e in data.get("emails", []):
+            if e not in emails:
+                emails.append(e)
+        for ph in data.get("phones", []):
+            if not any(p["e164"] == ph["e164"] for p in phones):
+                phones.append(ph)
+        for a in data.get("addresses", []):
+            if not any(x["formatted"] == a["formatted"] for x in addresses):
+                addresses.append(a)
+        for l in data.get("links", []):
+            if not any(x["url"] == l["url"] for x in links):
+                links.append(l)
+        for l in data.get("rel_me", []):
+            if not any(x["url"] == l["url"] for x in rel_me):
+                rel_me.append(l)
+
+    return {"base": base_url, "pages_fetched": pages, "pdfs": pdfs,
+            "identity": base.get("identity", {}), "emails": emails,
+            "phones": phones, "addresses": addresses, "links": links,
+            "rel_me": rel_me, "interests": base.get("interests", []),
+            "birth_hints": base.get("birth_hints", [])}
 
 
 def build_parser() -> argparse.ArgumentParser:

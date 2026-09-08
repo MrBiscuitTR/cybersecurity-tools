@@ -135,6 +135,27 @@ nothing writes, nothing contacts the subject.
   python -m osint.infra example.com --active
   ```
 
+- **[github.py](github.py)** — a GitHub account's profile fields plus the
+  **author email addresses in public commit metadata**. For anyone who writes
+  code this is usually the only place a real address is published. Bot/CI
+  identities are filtered; the noreply proxy's numeric id is kept as a permanent
+  account identifier.
+
+  ```bash
+  python -m osint.github MrBiscuitTR
+  ```
+
+- **[pdf.py](pdf.py)** — text and contact details out of PDFs (CVs, certificates,
+  bios). Three tiers, and it tells you which one ran: `pdftotext` when poppler is
+  installed, a stdlib content-stream parser otherwise, and `tesseract` OCR for
+  files with no text layer. Kerned `TJ` fragments are joined without spaces, so
+  an email survives instead of arriving as four pieces.
+
+  ```bash
+  python -m osint.pdf https://example.com/cv.pdf --region TR
+  python -m osint.pdf scan.pdf --ocr --lang eng+tur
+  ```
+
 - **[fetch.py](fetch.py)** — shared infrastructure: browser-realistic headers
   with UA rotation, redirect chains, cookie jars, anti-bot detection, the
   multi-source `gather()` fan-out, and an optional Playwright renderer.
@@ -163,8 +184,8 @@ each comes from:
 | Entity | Source |
 | --- | --- |
 | Person, alias, alternate spelling | profile/username metadata, Wikidata, LinkedIn |
-| Email address | Gravatar, git commit metadata, page text, permutation |
-| Phone number | `contacts.py`, E.164-validated with a confidence |
+| Email address | GitHub commit metadata, Gravatar, `mailto:` links, Cloudflare-obfuscated addresses, contact-page crawl, PDFs, permutation |
+| Phone number | `tel:` links, page text and PDFs — E.164-validated with a confidence |
 | Physical address | JSON-LD `PostalAddress`, microformats, free text |
 | Location | profile metadata, LinkedIn, Gravatar |
 | Social profile / handle / ID | ~70 platforms incl. Instagram, X, Facebook, TikTok |

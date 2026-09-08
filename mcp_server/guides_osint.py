@@ -414,3 +414,60 @@ ACTIVE VS PASSIVE
   browser-shaped requests, but still traffic to the target, so only use it on
   infrastructure the operator is authorized to touch.
 """
+
+GITHUB = """Everything GitHub publishes about an account, including the author's real email.
+
+WHY THIS MATTERS MORE THAN THE PROFILE PAGE
+  Every public commit stores the author's configured email in its metadata, and
+  the API hands it to anyone. A developer who has never written their address on
+  any page has usually pushed it to a public repo hundreds of times. This is the
+  single most reliable way to get a real address for a technical person.
+
+OUTPUT
+  profile   name, bio, company, location, blog, X handle, join date — the API
+            returns a dozen fields the HTML page never shows together. `company`
+            and `location` are strong disambiguators for search.
+  emails    two kinds, and they are NOT equivalent:
+              real      an actual mailbox -> feed it to osint_email
+              noreply   ID+login@users.noreply.github.com — a privacy proxy, not
+                        reachable. The NUMBER is still valuable: it is a
+                        permanent account id that survives username changes.
+            Bot/CI identities (dependabot, vercel, github-actions) are filtered.
+  orgs / topics / repos — what they actually work on.
+
+RATE LIMITS
+  60 requests/hour unauthenticated, which runs out fast. $GITHUB_TOKEN raises it
+  to 5000/hour and is the single most useful key for this whole package.
+
+WHAT TO DO NEXT
+  Real address -> osint_email (Gravatar identity, breaches, other accounts).
+  blog field -> osint_profile then osint_infra on the domain.
+  company -> osint_records and as `extra` for osint_websearch.
+"""
+
+PDF = """Extract text and contact details from a PDF — CVs, certificates, bios, scans.
+
+WHY IT MATTERS
+  A CV is usually the only document where somebody publishes a phone number or a
+  postal address, and CVs are PDFs. Pages linked from a personal site are worth
+  opening for exactly this reason.
+
+THREE TIERS, and the result says which one produced the text
+  pdftotext  poppler-utils, if installed. Best: resolves font encodings and
+             ToUnicode CMaps, so unusual fonts come out as real characters.
+  builtin    a stdlib parser. No dependencies. Good on ordinary text PDFs.
+  ocr        tesseract, if installed and `ocr` is set. The ONLY way to read a
+             PDF with no text layer.
+
+READING THE RESULT
+  has_text_layer=false means the file is a scan or an exported image. That is
+  not a tool failure and not an empty document — the text is in pixels. Say so,
+  and suggest OCR rather than reporting "no contact details found".
+  method=ocr means the text came from image recognition: expect character
+  errors, and verify anything you act on (a digit in a phone number especially).
+
+INPUT
+  source: a file path or an http(s) URL.
+  ocr: allow the OCR tier. lang: tesseract languages, e.g. "eng+tur".
+  region: ISO code so national-format phone numbers can be read.
+"""
