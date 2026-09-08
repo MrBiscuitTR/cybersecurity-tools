@@ -82,6 +82,10 @@ _BROWSERS: list[dict[str, str]] = [
 ]
 
 DEFAULT_TIMEOUT = 20.0
+# Hard cap on a single response body. Identity data lives in the first few
+# hundred KB of any page; past that it is bundled JS, base64 images or a file
+# download that would burn the whole sweep's time budget for nothing.
+MAX_BODY_BYTES = 3_000_000
 # Only encodings the stdlib can actually decode. Advertising `br` without a
 # brotli decoder yields unreadable bytes, which looks like a broken source.
 _ACCEPT_ENCODING = "gzip, deflate"
@@ -230,6 +234,7 @@ def get(
     follow_redirects: bool = True,
     rotate_ua: bool = True,
     data: bytes | None = None,
+    max_bytes: int = MAX_BODY_BYTES,
 ) -> Response:
     """Browser-realistic GET (or POST when ``data`` is given).
 
@@ -248,6 +253,8 @@ def get(
         follow_redirects: Follow 3xx (default True, like a browser).
         rotate_ua: Use a different browser identity on each retry.
         data: If set, sends a POST with this body.
+        max_bytes: Stop reading after this many bytes (truncated responses are
+            still parsed; identity data is never at the end of a huge page).
 
     Returns:
         A :class:`Response`, with the body preserved even on error codes.
@@ -277,7 +284,7 @@ def get(
         try:
             req = urllib.request.Request(url, headers=hdrs, data=data)
             with opener.open(req, timeout=timeout) as resp:
-                raw = _decompress(resp.read(), resp.headers.get("Content-Encoding", ""))
+                raw = _decompress(resp.read(max_bytes), resp.headers.get("Content-Encoding", ""))
                 rh = {k.lower(): v for k, v in resp.headers.items()}
                 r = Response(url, resp.geturl(), resp.status, raw, None,
                              time.time() - start, redirector.chain, rh, last_ua)
@@ -291,7 +298,8 @@ def get(
         except urllib.error.HTTPError as exc:
             # HTTPError is itself a file-like response: keep the body.
             try:
-                last_body = _decompress(exc.read(), exc.headers.get("Content-Encoding", ""))
+                last_body = _decompress(exc.read(max_bytes),
+                                        exc.headers.get("Content-Encoding", ""))
                 last_hdrs = {k.lower(): v for k, v in exc.headers.items()}
             except Exception:  # noqa: BLE001 - body is best-effort only
                 last_body, last_hdrs = b"", {}
@@ -378,8 +386,13 @@ def gather(
     if not sources:
         return results, down
 
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(workers, len(sources))) as pool:
+    # NOT a `with` block: ThreadPoolExecutor.__exit__ calls shutdown(wait=True),
+    # which blocks until every straggler finishes — so a `with` would silently
+    # ignore the timeout we just promised the caller. Shut down without waiting
+    # and cancel whatever hasn't started. Threads already in flight are bounded
+    # by their own socket timeouts.
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(sources)))
+    try:
         futures = {pool.submit(fn): name for name, fn in sources.items()}
         try:
             for fut in concurrent.futures.as_completed(futures, timeout=timeout):
@@ -398,6 +411,8 @@ def gather(
                 if name not in results and name not in down:
                     down[name] = "timed out"
                     fut.cancel()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return results, down
 
 

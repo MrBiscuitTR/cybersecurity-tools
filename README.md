@@ -45,7 +45,7 @@ Every tool obeys these (full detail in [docs/CONVENTIONS.md](docs/CONVENTIONS.md
 | [network/](network/) | Hosts, packets, protocols | protocol probes, wrappers over `tshark`/pcap |
 | [web/](web/) | HTTP(S) applications | header/TLS audit, favicon-hash lookup, endpoint checks |
 | [recon/](recon/) | Enumeration & info gathering | subdomain enum (crt.sh + fallbacks), DNS/RDAP sweeps |
-| [osint/](osint/) | People: identity resolution | handle sweep w/ false-positive control, profile/bio extraction, LinkedIn, public records, VIN/plate |
+| [osint/](osint/) | People: identity resolution | handle sweep across ~70 platforms w/ false-positive control, profile/bio extraction, phones/addresses, LinkedIn, public records, corporate ownership, domain infra, VIN/plate |
 | [crypto/](crypto/) | Ciphers, hashes, encoding | hash ID, cipher solvers, crypto-flaw inspection helpers |
 | [passwords/](passwords/) | Credential *analysis* | strength/entropy scoring (no cracker clones) |
 | [forensics/](forensics/) | Artifacts & captures | metadata/log parsing, pcap readers for AI consumption |

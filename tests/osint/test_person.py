@@ -121,3 +121,40 @@ def test_main_no_args_returns_2():
 def test_stages_constant_is_ordered():
     assert person.STAGES[0] == "seed"
     assert person.STAGES[-1] == "correlate"
+
+
+@pytest.mark.parametrize("value,ok", [
+    ("Çağan Efe Çalıdağ", True),
+    ("Chris Agan", True),
+    ("Cagancalidag cagancalidag.com Çağan Efe Çalıdağ", False),  # search title
+    ("Issues · MarginaliaSearch/MarginaliaSearch", False),
+    ("https://example.com/x", False),
+    ("A", False),
+])
+def test_looks_like_a_person_name(value, ok):
+    assert person.looks_like_a_person_name(value) is ok
+
+
+@pytest.mark.parametrize("hint,ok", [
+    ("10 December 1815", True),
+    ("1998", True),
+    ("Sep 5, 2026", False),   # a page date, not a birth date
+    ("2024", False),
+])
+def test_plausible_birth(hint, ok):
+    assert person._plausible_birth(hint) is ok
+
+
+def test_platform_hosts_cover_the_username_table():
+    """A missed platform host makes the infra stage profile twitch.tv as if it
+    were the subject's personal domain."""
+    import urllib.parse as up
+    from osint import username as u
+    for site in u.SITES:
+        host = up.urlparse(site.url.replace("{u}", "x")).netloc.lower()
+        host = host.removeprefix("www.")
+        if host.startswith("x."):
+            host = host[2:]
+        if host:
+            assert person._is_platform_host(host), host
+    assert not person._is_platform_host("simonwillison.net")

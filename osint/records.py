@@ -191,7 +191,92 @@ def _gleif(query: str, timeout: float) -> dict:
                 legal.get("country", "")])),
             "url": f"https://search.gleif.org/#/record/{r.get('id', '')}",
         })
-    return {"entities": out} if out else {}
+    if not out:
+        return {}
+    # Ownership graph for the best match: parents and subsidiaries.
+    rels = _gleif_relationships(out[0]["lei"], timeout) if out[0]["lei"] else {}
+    return {"entities": out, "relationships": rels}
+
+
+def _gleif_relationships(lei: str, timeout: float) -> dict:
+    """Corporate ownership around one LEI: direct/ultimate parents and children.
+
+    GLEIF is the only free, global, authoritative source for parent/subsidiary
+    links — the relationships are self-reported by the entity and validated by
+    the issuing LOU, which makes them far better evidence than a press release.
+    A 404 here is normal and means "no reported parent", not an error.
+    """
+    out: dict[str, object] = {}
+    for rel, key in (("direct-parent", "direct_parent"),
+                     ("ultimate-parent", "ultimate_parent")):
+        data, _ = fetch.get_json(f"https://api.gleif.org/api/v1/lei-records/{lei}/{rel}",
+                                 headers={"Accept": "application/vnd.api+json"},
+                                 timeout=timeout)
+        rec = (data or {}).get("data")
+        if isinstance(rec, dict):
+            ent = ((rec.get("attributes") or {}).get("entity") or {})
+            out[key] = {"lei": rec.get("id", ""),
+                        "name": (ent.get("legalName") or {}).get("name", ""),
+                        "jurisdiction": ent.get("jurisdiction", "")}
+    for rel, key in (("direct-children", "direct_children"),
+                     ("ultimate-children", "ultimate_children")):
+        data, _ = fetch.get_json(
+            f"https://api.gleif.org/api/v1/lei-records/{lei}/{rel}?page[size]=50",
+            headers={"Accept": "application/vnd.api+json"}, timeout=timeout)
+        recs = (data or {}).get("data")
+        if isinstance(recs, list) and recs:
+            out[key] = [{"lei": r.get("id", ""),
+                         "name": (((r.get("attributes") or {}).get("entity") or {})
+                                  .get("legalName") or {}).get("name", ""),
+                         "jurisdiction": (((r.get("attributes") or {}).get("entity") or {})
+                                          .get("jurisdiction", ""))}
+                        for r in recs[:50]]
+    return out
+
+
+def _companies_house_company(query: str, timeout: float) -> dict:
+    """UK company search + the officers (executives) of the best match.
+
+    Officer records are where a corporate search turns into person data: full
+    name, role, appointment date, nationality, a partial date of birth and a
+    correspondence address.
+    """
+    import base64
+    key = os.environ.get("COMPANIES_HOUSE_KEY", "")
+    if not key:
+        return {}
+    auth = {"Authorization": "Basic " + base64.b64encode(f"{key}:".encode()).decode()}
+    data, _ = fetch.get_json(
+        "https://api.company-information.service.gov.uk/search/companies"
+        f"?q={up.quote(query)}&items_per_page=5", headers=auth, timeout=timeout)
+    items = (data or {}).get("items") or []
+    if not items:
+        return {}
+    companies = [{"name": i.get("title", ""), "number": i.get("company_number", ""),
+                  "status": i.get("company_status", ""),
+                  "created": i.get("date_of_creation", ""),
+                  "address": i.get("address_snippet", ""),
+                  "url": "https://find-and-update.company-information.service.gov.uk"
+                         f"/company/{i.get('company_number', '')}"}
+                 for i in items[:5]]
+    officers: list[dict] = []
+    number = companies[0]["number"]
+    if number:
+        od, _ = fetch.get_json(
+            "https://api.company-information.service.gov.uk/company/"
+            f"{number}/officers?items_per_page=50", headers=auth, timeout=timeout)
+        for o in (od or {}).get("items", [])[:50]:
+            dob = o.get("date_of_birth") or {}
+            officers.append({
+                "name": o.get("name", ""), "role": o.get("officer_role", ""),
+                "appointed": o.get("appointed_on", ""),
+                "resigned": o.get("resigned_on", ""),
+                "nationality": o.get("nationality", ""),
+                "occupation": o.get("occupation", ""),
+                "dob": f"{dob.get('month', '')}/{dob.get('year', '')}" if dob else "",
+                "address": (o.get("address") or {}).get("locality", ""),
+                "company": companies[0]["name"]})
+    return {"companies": companies, "officers": officers}
 
 
 def _opencorporates(query: str, timeout: float) -> dict:
@@ -285,6 +370,7 @@ def run(
         sources["opensanctions"] = lambda: _opensanctions(q, timeout)
     if kind in ("auto", "company"):
         sources["gleif"] = lambda: _gleif(q, timeout)
+        sources["companies_house_co"] = lambda: _companies_house_company(q, timeout)
     sources["sec_edgar"] = lambda: _sec_edgar(q, timeout)
 
     log(f"[*] querying {len(sources)} registers for {q!r} ...")
@@ -314,7 +400,11 @@ def run(
                             + (got.get("opencorporates", {}) or {}).get("officers", [])),
         "sanctions": (got.get("opensanctions", {}) or {}).get("matches", []),
     }
+    ch_co = got.get("companies_house_co", {}) or {}
     company = {"gleif": (got.get("gleif", {}) or {}).get("entities", []),
+               "ownership": (got.get("gleif", {}) or {}).get("relationships", {}),
+               "registrations": ch_co.get("companies", []),
+               "executives": ch_co.get("officers", []),
                "sec_filings": (got.get("sec_edgar", {}) or {}).get("filings", []),
                "sec_total": (got.get("sec_edgar", {}) or {}).get("total", 0)}
 
@@ -332,6 +422,17 @@ def run(
     if person["officer_records"]:
         steps.append("Company officer records give a registered address and often a "
                      "partial DoB. Cross-check the address against other findings.")
+    own = company["ownership"]
+    if own.get("ultimate_parent") or own.get("direct_parent"):
+        parent = (own.get("ultimate_parent") or own.get("direct_parent") or {})
+        steps.append(f"Corporate parent: {parent.get('name', '')} — the group, not "
+                     "just this entity, is the thing to investigate.")
+    if own.get("direct_children"):
+        steps.append(f"{len(own['direct_children'])} subsidiaries reported to GLEIF; "
+                     "each is another osint.records / osint.infra target.")
+    if company["executives"]:
+        steps.append(f"{len(company['executives'])} company officers with roles, "
+                     "partial DoB and nationality — these are person entities.")
     if company["sec_filings"]:
         steps.append(f"{company['sec_total']} SEC filings mention this name; the filing "
                      "pages list officers, addresses and signatures.")
@@ -397,6 +498,33 @@ def _compact_lines(res: dict) -> list[str]:
             lines.append(f"  {e['name']}  [{e['status']}] {e['jurisdiction']}  LEI={e['lei']}")
             if e["address"]:
                 lines.append(f"    {e['address']}")
+    own = c.get("ownership") or {}
+    if own:
+        lines.append("## CORPORATE OWNERSHIP (GLEIF, self-reported + LOU-validated)")
+        for key, label in (("direct_parent", "direct parent"),
+                           ("ultimate_parent", "ultimate parent")):
+            if own.get(key):
+                p_ = own[key]
+                lines.append(f"  {label:<17} {p_['name']}  [{p_['jurisdiction']}] "
+                             f"LEI={p_['lei']}")
+        for key, label in (("direct_children", "direct subsidiary"),
+                           ("ultimate_children", "ultimate subsidiary")):
+            for ch in own.get(key, [])[:25]:
+                lines.append(f"  {label:<17} {ch['name']}  [{ch['jurisdiction']}]")
+    if c.get("registrations"):
+        lines.append(f"## COMPANY REGISTRATIONS ({len(c['registrations'])})")
+        for co in c["registrations"]:
+            lines.append(f"  {co['name']}  #{co['number']}  [{co['status']}] "
+                         f"inc. {co['created']}")
+            if co.get("address"):
+                lines.append(f"    {co['address']}")
+    if c.get("executives"):
+        lines.append(f"## EXECUTIVES / OFFICERS ({len(c['executives'])})")
+        for o in c["executives"][:30]:
+            bits = [o.get("name", ""), o.get("role", ""), o.get("occupation", ""),
+                    o.get("nationality", ""), f"DoB {o['dob']}" if o.get("dob") else "",
+                    f"appointed {o['appointed']}" if o.get("appointed") else ""]
+            lines.append("  " + " | ".join(b for b in bits if b))
     if c["sec_filings"]:
         lines.append(f"## SEC EDGAR ({c['sec_total']} total, showing {len(c['sec_filings'])})")
         for fl in c["sec_filings"]:

@@ -102,6 +102,11 @@ def _clean_html(text: str) -> str:
         stripped = re.sub(r"^.*?https?://[^\s›»|]+(?:\s*[›»]\s*[^\s›»]+)*\s*", "", t)
         if len(stripped) >= 8:  # only if something meaningful survives
             t = stripped
+        else:
+            # The whole title was a breadcrumb (some engines emit nothing else).
+            # Drop the URL tokens rather than hand back a fake "title".
+            t = re.sub(r"https?://\S+", " ", t)
+            t = re.sub(r"\s+", " ", t).strip(" ›»·|-–—")
     return t.strip(" ·|-–—")
 
 
@@ -465,8 +470,7 @@ def run(
         extra: Disambiguating terms (employer, city, university).
         engines: Engine subset; None = all available.
         count: Results per engine per query.
-        max_queries: Cap on dork queries actually executed (they run serially
-            to stay polite; raise it when you need full coverage).
+        max_queries: Cap on dork queries executed (4 run concurrently).
         timeout: Per-query wall-clock budget.
 
     Returns:
@@ -487,9 +491,23 @@ def run(
     down: dict[str, str] = {}
     per_query: list[dict] = []
 
-    for i, q in enumerate(queries, 1):
-        log(f"[*] [{i}/{len(queries)}] {q}")
-        res = search(q, engines=engines, count=count, timeout=timeout)
+    # Queries are independent, so run several at once. Serially, a 10-query dork
+    # set with a 45s budget each could take over five minutes — almost all of it
+    # spent waiting. Concurrency is kept modest (4) because every query hits the
+    # same engines, and hammering them is how you get rate-limited.
+    log(f"[*] {len(queries)} queries across "
+        f"{len(engines or ENGINES)} engines, 4 at a time ...")
+    per_q = {q: (lambda query=q: search(query, engines=engines, count=count,
+                                        timeout=timeout))
+             for q in queries}
+    got, q_down = fetch.gather(per_q, workers=4, timeout=timeout * 3)
+
+    for q in queries:
+        res = got.get(q)
+        if not res:
+            per_query.append({"query": q, "hits": 0, "engines": [],
+                              "error": q_down.get(q, "no results")})
+            continue
         used.update(res["engines_used"])
         down.update(res["engines_down"])
         per_query.append({"query": q, "hits": len(res["results"]),

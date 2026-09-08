@@ -17,12 +17,20 @@ Every result carries one of five states:
     absent      the site says no such user
     unreliable  the site also "found" a random 14-char control handle
     unknown     blocked (403/429), timed out, or ambiguous — retry or open it
-    manual      login-walled by design (X, Instagram, ...) — URL emitted, never
-                guessed at
+    manual      genuinely uncheckable (no addressable profile URL, or a bot wall
+                on every request) — the URL is emitted, never a guess
+
+The big social platforms are NOT login-walled for this purpose, despite the
+common assumption. Instagram, X, Facebook, Threads, TikTok, Twitch, Pinterest,
+Snapchat and Medium all serve OpenGraph metadata for public profiles to
+unauthenticated requests and omit it for handles that don't exist — so they are
+checked properly (`mode="meta"`), and the display name, bio and follower counts
+come back with the verdict. Instagram serves that metadata even for PRIVATE
+accounts: the name, bio and counts are public, only the posts are not.
 
 The platform table was validated by probing a known-real handle and a random one
-against every site; sites that couldn't discriminate were demoted to `manual`
-rather than left in to generate noise.
+against every site; only sites that genuinely couldn't discriminate were left as
+`manual`.
 
 Dependencies: standard library, via :mod:`osint.fetch` (browser-realistic
 headers, redirect following, cookie jar, UA rotation on 403/429).
@@ -42,13 +50,15 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import random
 import re
 import secrets
 import sys
+import time
 from dataclasses import dataclass
 
 from common.output import emit, log
-from osint import fetch
+from osint import fetch, profile
 
 
 @dataclass(frozen=True)
@@ -59,12 +69,19 @@ class Site:
         name: Short platform id used in output.
         url: Human-facing profile URL template containing ``{u}``.
         category: dev/social/pro/creative/blog/gaming/commerce.
-        mode: ``status`` (verdict from HTTP code), ``text`` (verdict from a body
-            marker), or ``manual`` (never probed; URL emitted for a human).
+        mode: ``status`` (verdict from the HTTP code), ``text`` (verdict from a
+            body marker), ``meta`` (verdict from OpenGraph tags, which also
+            yields the display name and bio), or ``manual`` (never probed).
         exists_status: Codes meaning "exists" (mode=status).
-        absent_status: Codes meaning "no such account" (mode=status).
-        exists_text: Body substring proving existence (mode=text).
-        absent_text: Body substring proving absence (mode=text).
+        absent_status: Codes meaning "no such account".
+        exists_text: Body substring proving existence; ``{u}`` is substituted.
+        absent_text: Body substring proving absence; ``{u}`` is substituted.
+        absent_title: Substrings in og:title that mean "no such account" — a
+            "profile not found" page served with a 200 (mode=meta).
+        generic_title: og:title values that are just the site's own brand name.
+            These are AMBIGUOUS: the platform serves the same generic page for a
+            handle that doesn't exist AND for every handle once it starts
+            rate-limiting you. Reported as unknown, never as absent.
         probe_url: API/alternate URL fetched instead of ``url`` when it gives a
             cleaner verdict than the human-facing page.
         note: Caveat surfaced with the result.
@@ -78,6 +95,8 @@ class Site:
     absent_status: tuple[int, ...] = (404,)
     exists_text: str = ""
     absent_text: str = ""
+    absent_title: tuple[str, ...] = ()
+    generic_title: tuple[str, ...] = ()
     probe_url: str = ""
     note: str = ""
 
@@ -135,14 +154,25 @@ SITES: list[Site] = [
     Site("gravatar", "https://gravatar.com/{u}", "social",
          note="hit means a Gravatar profile exists -> run osint.email for its JSON"),
     Site("quora", "https://www.quora.com/profile/{u}", "social"),
-    Site("x/twitter", "https://x.com/{u}", "social", mode="manual"),
-    Site("instagram", "https://www.instagram.com/{u}/", "social", mode="manual"),
-    Site("facebook", "https://www.facebook.com/{u}", "social", mode="manual"),
-    Site("threads", "https://www.threads.net/@{u}", "social", mode="manual"),
-    Site("tiktok", "https://www.tiktok.com/@{u}", "social", mode="manual"),
-    Site("snapchat", "https://www.snapchat.com/add/{u}", "social", mode="manual"),
-    Site("reddit", "https://www.reddit.com/user/{u}/", "social", mode="manual"),
-    Site("pinterest", "https://www.pinterest.com/{u}/", "social", mode="manual"),
+    Site("x/twitter", "https://x.com/{u}", "social", mode="meta",
+         absent_status=(404,), absent_title=("Profile Not Found", "404")),
+    Site("instagram", "https://www.instagram.com/{u}/", "social", mode="meta",
+         note="public metadata is served even for private accounts: the name, "
+              "bio and follower counts are visible, the posts are not",
+         generic_title=("Instagram",)),
+    Site("facebook", "https://www.facebook.com/{u}", "social", mode="meta",
+         absent_title=("Content Not Found",), generic_title=("Facebook", "Log in")),
+    Site("threads", "https://www.threads.net/@{u}", "social", mode="meta",
+         generic_title=("Threads • Log in", "Threads")),
+    Site("tiktok", "https://www.tiktok.com/@{u}", "social", mode="text",
+         exists_text='"uniqueId":"{u}"'),
+    Site("snapchat", "https://www.snapchat.com/add/{u}", "social",
+         absent_status=(404,)),
+    Site("reddit", "https://www.reddit.com/user/{u}/", "social", mode="meta",
+         note="Reddit blocks datacenter IPs; expect UNKNOWN from a VPS/cloud host "
+              "and a real answer from a residential connection"),
+    Site("pinterest", "https://www.pinterest.com/{u}/", "social", mode="meta",
+         generic_title=("Pinterest",)),
     Site("tumblr", "https://{u}.tumblr.com", "social", mode="manual"),
     Site("vk", "https://vk.com/{u}", "social", mode="manual"),
     Site("discord", "https://discord.com/users/{u}", "social", mode="manual",
@@ -178,8 +208,8 @@ SITES: list[Site] = [
 
     # --- writing / blogs --------------------------------------------------------
     Site("substack", "https://{u}.substack.com", "blog"),
-    Site("medium", "https://medium.com/@{u}", "blog", mode="manual",
-         note="returns 200 for every handle"),
+    Site("medium", "https://medium.com/@{u}", "blog", mode="meta",
+         generic_title=("Medium",)),
     Site("wordpress", "https://{u}.wordpress.com", "blog", mode="manual"),
     Site("blogspot", "https://{u}.blogspot.com", "blog", mode="manual"),
     Site("hashnode", "https://hashnode.com/@{u}", "blog", mode="manual"),
@@ -192,7 +222,8 @@ SITES: list[Site] = [
     Site("strava", "https://www.strava.com/athletes/{u}", "gaming"),
     Site("steam", "https://steamcommunity.com/id/{u}", "gaming", mode="text",
          absent_text="The specified profile could not be found"),
-    Site("twitch", "https://www.twitch.tv/{u}", "gaming", mode="manual"),
+    Site("twitch", "https://www.twitch.tv/{u}", "gaming", mode="meta",
+         generic_title=("Twitch",)),
     Site("roblox", "https://www.roblox.com/search/users?keyword={u}", "gaming", mode="manual"),
 
     # --- commerce / payments -------------------------------------------------------
@@ -248,21 +279,55 @@ def check_site(site: Site, username: str, *, timeout: float = 10.0) -> dict:
         return {**base, "state": "manual", "http": 0,
                 "note": site.note or "login-walled or non-discriminating; open to confirm"}
 
-    # retries=1: a 403/429 gets one more shot with a different browser identity.
-    r = fetch.get(site.check_url(username), timeout=timeout, retries=1)
+    # One attempt only. A 403/429 is re-checked later by the retry pass, so
+    # retrying inline just doubles the worst case for every slow site.
+    r = fetch.get(site.check_url(username), timeout=timeout, retries=0)
 
     if site.mode == "text":
         if not r.ok:
+            if r.status in site.absent_status:
+                return {**base, "state": "absent", "http": r.status, "note": ""}
             return {**base, "state": "unknown", "http": r.status,
                     "note": r.error or f"HTTP {r.status}"}
         body = r.text
         if site.exists_text:
-            hit = site.exists_text in body
+            hit = site.exists_text.format(u=username) in body
             return {**base, "state": "found" if hit else "absent", "http": r.status,
                     "note": f"marker {'present' if hit else 'missing'}"}
-        gone = site.absent_text in body
+        gone = site.absent_text.format(u=username) in body
         return {**base, "state": "absent" if gone else "found", "http": r.status,
                 "note": f"absence marker {'present' if gone else 'missing'}"}
+
+    if site.mode == "meta":
+        # These platforms are not really login-walled: they serve OpenGraph tags
+        # for public profiles to anyone, and omit them (or serve a generic
+        # landing page) for handles that don't exist. That's a clean signal AND
+        # it hands back the display name, bio and follower counts.
+        if r.status in site.absent_status:
+            return {**base, "state": "absent", "http": r.status, "note": ""}
+        if not r.ok:
+            return {**base, "state": "unknown", "http": r.status,
+                    "note": ("anti-bot page" if r.blocked else r.error or f"HTTP {r.status}")}
+        metas = profile.meta_map(r.text)
+        title = metas.get("og:title", "").strip()
+        desc = metas.get("og:description", "")
+        if any(g.lower() == title.lower() for g in site.generic_title):
+            # The site's own brand name as the title means it served its generic
+            # page. That happens both for handles that don't exist AND for every
+            # handle once the platform throttles your IP, so the two cannot be
+            # told apart from here — say so instead of guessing "absent".
+            return {**base, "state": "unknown", "http": r.status,
+                    "note": f"generic '{title}' page served — either no such "
+                            "handle or the platform is rate-limiting this IP; "
+                            "open the URL to settle it"}
+        if not title or any(bad.lower() in title.lower() for bad in site.absent_title):
+            return {**base, "state": "absent", "http": r.status,
+                    "note": "no profile metadata served for this handle"}
+        name, stats = _parse_profile_meta(title, desc)
+        return {**base, "state": "found", "http": r.status,
+                "profile_name": name, "bio": desc, "stats": stats,
+                "image": metas.get("og:image", ""),
+                "note": (site.note or "verified via profile metadata")}
 
     if r.status in site.exists_status and not r.blocked:
         return {**base, "state": "found", "http": r.status, "note": site.note}
@@ -270,6 +335,41 @@ def check_site(site: Site, username: str, *, timeout: float = 10.0) -> dict:
         return {**base, "state": "absent", "http": r.status, "note": ""}
     return {**base, "state": "unknown", "http": r.status,
             "note": ("anti-bot page" if r.blocked else r.error or f"HTTP {r.status}")}
+
+
+_STAT_RE = re.compile(
+    r"([\d.,]+\s*[KMB]?)\s+(Followers?|Following|Posts?|Threads?|likes?|"
+    r"friends?|subscribers?|repositories)", re.I)
+
+
+def _parse_profile_meta(title: str, description: str) -> tuple[str, dict[str, str]]:
+    """Pull the display name and follower/post counts out of OpenGraph tags.
+
+    Platforms write the name in the title in a handful of shapes:
+        "Çağan Efe Çalıdağ (@cagancalidag) • Instagram photos and videos"
+        "jack (@jack) on X"
+        "Ninja - Twitch"
+        "Dan – Medium"
+    and the counts in the description ("307 Followers, 377 Following, 0 Posts").
+
+    Returns:
+        ``(display_name, {stat_name: value})``. The name is "" when the title
+        carries no separable name.
+    """
+    name = title.strip()
+    # Drop a trailing site suffix after a dash/bullet separator.
+    name = re.split(r"\s+[•·|]\s+|\s+[-–—]\s+", name)[0].strip()
+    # "Name (@handle)" -> "Name"; a bare "(@handle)" leaves nothing, which is
+    # correct — that platform didn't give us a real name.
+    name = re.sub(r"\s*\(@[^)]*\)\s*", " ", name).strip()
+    name = re.sub(r"\s+on\s+(X|Twitter|Instagram|Threads)$", "", name, flags=re.I).strip()
+    stats = {k.lower().rstrip("s"): v.strip()
+             for v, k in _STAT_RE.findall(description or "")}
+    # Guard against callers passing a search-result breadcrumb rather than a
+    # real og:title — a URL or a path fragment is not somebody's name.
+    if not name or name.startswith("@") or re.search(r"://|[›»/]|\.\w{2,4}", name):
+        return "", stats
+    return name, stats
 
 
 def _control_handle() -> str:
@@ -282,9 +382,14 @@ def run(
     usernames: list[str] | str,
     *,
     categories: list[str] | None = None,
-    timeout: float = 10.0,
-    workers: int = 25,
+    timeout: float = 8.0,
+    workers: int = 60,
     control: bool = True,
+    delay: float = 0.4,
+    retry_unknown: bool = True,
+    max_retries: int = 25,
+    cooldown: float = 3.0,
+    site_budget: float = 40.0,
 ) -> dict:
     """Sweep one or more handles across the platform table.
 
@@ -292,8 +397,17 @@ def run(
         usernames: One handle or a list of candidates to compare side by side.
         categories: Restrict to these categories (see ``CATEGORIES``). None = all.
         timeout: Per-request timeout in seconds.
-        workers: Concurrent requests. Modest on purpose — polite traffic to
-            public pages, not a stress test.
+        workers: How many SITES to check in parallel. Within one site the
+            handles are checked sequentially, so a platform never sees more than
+            one request from us at a time.
+        delay: Base pause (plus jitter) between handles on the same site.
+        retry_unknown: After the sweep, re-check the results that look like
+            throttling (generic page, 429/403) once, serially, after a pause.
+            This is what rescues a real Instagram/X hit from a busy run.
+        max_retries: Cap on those retries, so the pass stays bounded.
+        cooldown: Seconds to wait before the retry pass.
+        site_budget: Wall-clock cap per site. Remaining handles for a site that
+            blows through it are reported as unknown instead of stalling the run.
         control: Probe a random control handle per site and quarantine any site
             that "finds" it. Disabling doubles speed and destroys trust in the
             output; leave it on.
@@ -322,28 +436,91 @@ def run(
     probed = [s for s in sites if s.mode != "manual"]
     ctrl = _control_handle()
 
-    jobs: list[tuple[Site, str]] = [(s, u) for s in probed for u in users]
-    if control:
-        jobs += [(s, ctrl) for s in probed]
-
+    todo = list(users) + ([ctrl] if control else [])
     log(f"[*] {len(users)} handle(s) x {len(probed)} sites"
         + (f" + {len(probed)} control probes" if control else "")
-        + f" = {len(jobs)} requests ...")
+        + f" = {len(probed) * len(todo)} requests "
+          f"({len(probed)} sites in parallel, handles sequential per site) ...")
+
+    def sweep_one_site(site: Site) -> dict[tuple[str, str], dict]:
+        """Check every handle against ONE site, one request at a time.
+
+        Parallelism is across sites, never within a site. Firing nine
+        simultaneous requests at Instagram for nine candidate handles is what
+        makes a platform start serving its generic page to you — which then
+        looks like "site is unreliable" and throws away real hits. One request
+        per host at a time, with a little jitter, keeps every platform answering.
+        """
+        out: dict[tuple[str, str], dict] = {}
+        deadline = time.monotonic() + site_budget
+        for i, u in enumerate(todo):
+            if time.monotonic() > deadline:
+                # One pathological site must not set the wall-clock floor for
+                # the whole sweep; the rest of its handles are reported honestly
+                # as unknown rather than silently dropped.
+                out[(site.name, u)] = {
+                    "site": site.name, "category": site.category, "username": u,
+                    "url": site.profile_url(u), "state": "unknown", "http": 0,
+                    "note": f"site too slow (over {site_budget:.0f}s budget); retry it alone"}
+                continue
+            if i:
+                time.sleep(delay + random.uniform(0, delay))
+            try:
+                out[(site.name, u)] = check_site(site, u, timeout=timeout)
+            except Exception as exc:  # noqa: BLE001 - never let one site win
+                out[(site.name, u)] = {
+                    "site": site.name, "category": site.category, "username": u,
+                    "url": site.profile_url(u), "state": "unknown", "http": 0,
+                    "note": f"{type(exc).__name__}: {exc}"}
+        return out
 
     raw: dict[tuple[str, str], dict] = {}
-    if jobs:
+    if probed:
         with concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(workers, len(jobs))) as pool:
-            futs = {pool.submit(check_site, s, u, timeout=timeout): (s.name, u)
-                    for s, u in jobs}
-            for fut in concurrent.futures.as_completed(futs):
-                key = futs[fut]
+                max_workers=min(workers, len(probed))) as pool:
+            for chunk in pool.map(sweep_one_site, probed):
+                raw.update(chunk)
+
+    # Second chance. A platform that served its generic page or a 429 during the
+    # burst will usually answer properly once things go quiet, and those are
+    # exactly the results worth rescuing: an "unknown" on Instagram can be a real
+    # account with the subject's full name on it. Retried serially, with a real
+    # pause, and capped so this can't run away.
+    by_site = {s.name: s for s in probed}
+    retryable = [k for k, r in raw.items()
+                 if r["state"] == "unknown" and (
+                     "generic" in r.get("note", "") or r.get("http") in (429, 403))]
+    if retryable and retry_unknown:
+        retryable = retryable[:max_retries]
+        log(f"[*] retrying {len(retryable)} throttled check(s) after a pause ...")
+        time.sleep(cooldown)
+        grouped: dict[str, list[str]] = {}
+        for site_name, u in retryable:
+            grouped.setdefault(site_name, []).append(u)
+
+        def retry_site(item: tuple[str, list[str]]) -> dict[tuple[str, str], dict]:
+            site_name, handles_to_retry = item
+            site = by_site.get(site_name)
+            fixed: dict[tuple[str, str], dict] = {}
+            if not site:
+                return fixed
+            for i, u in enumerate(handles_to_retry):
+                if i:
+                    time.sleep(delay * 2)
                 try:
-                    raw[key] = fut.result()
-                except Exception as exc:  # noqa: BLE001 - never let one site win
-                    raw[key] = {"site": key[0], "category": "", "username": key[1],
-                                "url": "", "state": "unknown", "http": 0,
-                                "note": f"{type(exc).__name__}: {exc}"}
+                    again = check_site(site, u, timeout=timeout)
+                except Exception:  # noqa: BLE001 - a failed retry keeps the old result
+                    continue
+                if again["state"] != "unknown":
+                    fixed[(site_name, u)] = {
+                        **again,
+                        "note": (again.get("note", "") + " (resolved on retry)").strip()}
+            return fixed
+
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(workers, len(grouped))) as pool:
+            for chunk in pool.map(retry_site, grouped.items()):
+                raw.update(chunk)
 
     unreliable_sites = {s.name for s in probed
                         if control and raw.get((s.name, ctrl), {}).get("state") == "found"}
@@ -382,8 +559,11 @@ def run(
         "Compare handles: a handle found on 6 sites and one found on 1 are not "
         "equally likely to be the same person. Check the bios before merging.",
         "UNKNOWN is not ABSENT. Those sites blocked us; open them by hand or retry.",
-        "MANUAL sites are where most people actually are (Instagram, X, LinkedIn). "
-        "Open those URLs — the check can't be automated honestly.",
+        "Instagram/X/Facebook/Threads/TikTok/Twitch/Medium hits are verified from "
+        "the profile metadata those sites serve publicly — the name, bio and "
+        "follower counts come with them, even for private Instagram accounts.",
+        "MANUAL is now only for sites that genuinely cannot be checked (no "
+        "addressable profile URL, or a bot wall on every request). Open those.",
     ]
     if unreliable_sites:
         next_steps.append(
@@ -406,8 +586,15 @@ def _compact_lines(res: dict, show_all: bool = False) -> list[str]:
 
     lines.append(f"## FOUND ({len(res['found'])}) — site proved it rejects a random control")
     for r in res["found"]:
-        note = f"   ({r['note']})" if r["note"] else ""
-        lines.append(f"  {r['username']:<18} [{r['category']}] {r['site']:<16} {r['url']}{note}")
+        lines.append(f"  {r['username']:<18} [{r['category']}] {r['site']:<16} {r['url']}")
+        if r.get("profile_name"):
+            lines.append(f"  {'':<18}   name: {r['profile_name']}")
+        if r.get("stats"):
+            lines.append(f"  {'':<18}   {', '.join(f'{k}: {v}' for k, v in r['stats'].items())}")
+        if r.get("bio"):
+            lines.append(f"  {'':<18}   bio: {r['bio'][:160]}")
+        if r.get("note"):
+            lines.append(f"  {'':<18}   note: {r['note']}")
     if not res["found"]:
         lines.append("  (none)")
 
@@ -449,8 +636,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("username", nargs="*", help="One or more handles (@ and URLs are fine).")
     p.add_argument("--category", default="",
                    help=f"Comma-separated subset of: {', '.join(CATEGORIES)}")
-    p.add_argument("--timeout", type=float, default=10.0, help="Per-request timeout (default 10).")
-    p.add_argument("--workers", type=int, default=25, help="Concurrent requests (default 25).")
+    p.add_argument("--timeout", type=float, default=8.0, help="Per-request timeout (default 8).")
+    p.add_argument("--workers", type=int, default=60,
+                   help="Sites checked in parallel (default 60 = all at once). "
+                        "Each site is still probed one handle at a time.")
+    p.add_argument("--delay", type=float, default=0.4,
+                   help="Pause between handles on the same site (default 0.4s).")
+    p.add_argument("--no-retry", action="store_true",
+                   help="Skip the retry pass for throttled checks (faster, lossier).")
     p.add_argument("--no-control", action="store_true",
                    help="Skip control probes (2x faster, results untrustworthy).")
     p.add_argument("--all", action="store_true", help="Also show absent counts.")
@@ -472,7 +665,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     try:
         res = run(args.username, categories=cats, timeout=args.timeout,
-                  workers=args.workers, control=not args.no_control)
+                  workers=args.workers, control=not args.no_control,
+                  delay=args.delay, retry_unknown=not args.no_retry)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

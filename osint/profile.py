@@ -20,7 +20,9 @@ kept so an operator can see where a claim came from and disagree with it:
     3. OpenGraph + Twitter cards — title, description, avatar, first/last name
     4. plain HTML — <title>, <h1>, meta description
     5. regex sweep of the whole body — emails (including "name [at] host"
-       obfuscation), phone numbers, and outbound links to ~40 known platforms
+       obfuscation), E.164-validated phone numbers and postal addresses
+       (via :mod:`osint.contacts`), interests, and outbound links to ~50
+       known platforms
 
 Dependencies: standard library only (via :mod:`osint.fetch`). No API key. An
 optional ``--render`` flag uses Playwright for JS-only pages if it is installed;
@@ -46,7 +48,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from common.output import emit, log
-from osint import fetch
+from osint import contacts, fetch
 
 # (host fragment, platform, regex capturing the handle, max path segments).
 # The segment cap is what separates a profile from site furniture:
@@ -155,6 +157,12 @@ _BIRTH_RE = re.compile(
     r"|(?:1[89]|20)\d{2}"
     r")")
 _TAG_RE = re.compile(r"<(script|style)\b.*?</\1>", re.S | re.I)
+_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+# Tags whose contents are never identity data. <script> is included here, so
+# JSON-LD must be read before reduce_html() runs.
+_NOISE_TAG_RE = re.compile(
+    r"<(script|style|noscript|svg|canvas|iframe|template|video|audio|source|"
+    r"picture|object|embed|map|figure)\b[^>]*>.*?</\1\s*>", re.S | re.I)
 
 
 def _plausible_email(addr: str) -> bool:
@@ -170,6 +178,35 @@ def _plausible_email(addr: str) -> bool:
     return len(tld) == 2 or tld in _COMMON_TLDS or two in _COMMON_TLDS
 
 
+def reduce_html(page_html: str, *, max_chars: int = 600_000) -> str:
+    """Drop the parts of a page that never contain identity data.
+
+    Modern pages are mostly machinery: inline scripts, CSS, SVG sprites, base64
+    images. On a 580KB Wikipedia page that machinery is ~90% of the bytes, and
+    every regex sweep pays for all of it. This removes comments, scripts,
+    styles, SVG, iframes and embedded media, and keeps everything semantic —
+    links, headings, navs, paragraphs, lists, spans, tables and, crucially, the
+    ``<meta>`` and ``<head>`` tags that carry the structured identity fields.
+
+    JSON-LD lives inside ``<script type="application/ld+json">`` and would be
+    destroyed here, so :func:`extract` reads it from the ORIGINAL html before
+    calling this.
+
+    Args:
+        page_html: Raw HTML.
+        max_chars: Hard cap after reduction; pathological pages get truncated
+            rather than allowed to burn the whole time budget.
+
+    Returns:
+        Reduced HTML, semantically equivalent for extraction purposes.
+    """
+    h = _COMMENT_RE.sub(" ", page_html)
+    h = _NOISE_TAG_RE.sub(" ", h)
+    # data: URIs are frequently megabytes of base64 with no information in them.
+    h = re.sub(r"(?:src|href)\s*=\s*([\"'])data:[^\"']{200,}?\1", "", h, flags=re.I)
+    return h[:max_chars]
+
+
 def _text_of(page_html: str) -> str:
     """Strip tags/scripts and collapse whitespace, for regex sweeps."""
     body = _TAG_RE.sub(" ", page_html)
@@ -177,17 +214,32 @@ def _text_of(page_html: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(body)).strip()
 
 
-def _meta(page_html: str, key: str) -> str:
-    """Read a <meta property|name="key" content="..."> value."""
-    for attr in ("property", "name", "itemprop"):
-        m = re.search(rf'<meta[^>]+{attr}=["\']{re.escape(key)}["\'][^>]*'
-                      rf'content=["\'](.*?)["\']', page_html, re.I | re.S)
-        if not m:
-            m = re.search(rf'<meta[^>]+content=["\'](.*?)["\'][^>]*'
-                          rf'{attr}=["\']{re.escape(key)}["\']', page_html, re.I | re.S)
-        if m:
-            return html.unescape(m.group(1)).strip()
-    return ""
+def meta_map(page_html: str) -> dict[str, str]:
+    """Parse every ``<meta>`` tag once into ``{key: content}``.
+
+    Replaces per-key regex searches over the whole document. Looking up 12 keys
+    that way cost 8.6 seconds on a 580KB page — each miss re-scanned the entire
+    document with a ``.*?`` under ``re.S``. One linear pass is ~1000x faster and
+    also picks up keys we didn't think to ask for.
+
+    Keys are lowercased; ``property``, ``name`` and ``itemprop`` are all treated
+    as the key attribute. First value wins.
+    """
+    out: dict[str, str] = {}
+    for m in re.finditer(r"<meta\b([^>]*)>", page_html, re.I):
+        attrs = m.group(1)  # short string: regexes below can't blow up
+        key = ""
+        for attr in ("property", "name", "itemprop"):
+            km = re.search(rf'\b{attr}\s*=\s*(["\'])(.*?)\1', attrs, re.I | re.S)
+            if km:
+                key = km.group(2).strip().lower()
+                break
+        if not key or key in out:
+            continue
+        cm = re.search(r'\bcontent\s*=\s*(["\'])(.*?)\1', attrs, re.I | re.S)
+        if cm:
+            out[key] = html.unescape(cm.group(2)).strip()
+    return out
 
 
 def _json_ld(page_html: str) -> list[dict]:
@@ -223,6 +275,19 @@ def _is_masked(name: str) -> bool:
     """
     stripped = name.replace("*", "").replace("·", "").strip()
     return "*" in name and len(stripped) < max(3, len(name) * 0.4)
+
+
+def _string_list(value: Any) -> list[str]:
+    """Normalize a schema.org field that may be a string, a list, or objects."""
+    items = value if isinstance(value, list) else ([value] if value else [])
+    out = []
+    for it in items:
+        s = (it if isinstance(it, str)
+             else str(it.get("name", "")) if isinstance(it, dict) else "")
+        s = s.strip()
+        if s and s not in out:
+            out.append(s)
+    return out
 
 
 def _org_names(value: Any) -> list[dict]:
@@ -271,6 +336,9 @@ def _person_from_jsonld(nodes: list[dict]) -> dict:
             "alumni_of": _org_names(node.get("alumniOf")),
             "same_as": ([node["sameAs"]] if isinstance(node.get("sameAs"), str)
                         else list(node.get("sameAs") or [])),
+            "interests": _string_list(node.get("knowsAbout"))
+                         + _string_list(node.get("knowsLanguage"))
+                         + _string_list(node.get("award")),
             "image": (node.get("image", {}).get("contentUrl", "")
                       if isinstance(node.get("image"), dict) else str(node.get("image", ""))),
         }
@@ -312,26 +380,33 @@ def classify_link(url: str) -> dict | None:
     return None
 
 
-def extract(page_html: str, base_url: str = "") -> dict:
+def extract(page_html: str, base_url: str = "", *, region: str = "") -> dict:
     """Run every extraction layer over one page's HTML.
 
     Args:
         page_html: Raw HTML.
         base_url: URL the HTML came from (used to resolve relative links).
+        region: ISO country code assumed for phone numbers written without a
+            country code, and preferred for ambiguous postcode shapes.
 
     Returns:
         ``{"identity", "links", "rel_me", "emails", "phones", "birth_hints",
         "jsonld_person", "opengraph", "title", "description", "raw_jsonld_types"}``.
     """
+    # JSON-LD lives inside <script>, which reduce_html() strips — read it first.
     nodes = _json_ld(page_html)
     person = _person_from_jsonld(nodes)
+
+    page_html = reduce_html(page_html)
     text = _text_of(page_html)
 
-    og = {k: _meta(page_html, k) for k in
+    metas = meta_map(page_html)
+    og = {k: metas[k] for k in
           ("og:title", "og:description", "og:image", "og:url", "og:site_name",
            "profile:first_name", "profile:last_name", "profile:username",
-           "twitter:title", "twitter:description", "twitter:creator", "description")}
-    og = {k: v for k, v in og.items() if v}
+           "twitter:title", "twitter:description", "twitter:creator", "description",
+           "author", "keywords")
+          if metas.get(k)}
 
     title_m = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.S | re.I)
     title = html.unescape(title_m.group(1)).strip() if title_m else ""
@@ -378,9 +453,8 @@ def extract(page_html: str, base_url: str = "") -> dict:
         if cand not in emails and _plausible_email(cand):
             emails.append(cand)
 
-    phones = sorted({re.sub(r"\s{2,}", " ", p.group(0)).strip()
-                     for p in _PHONE_RE.finditer(text)
-                     if 9 <= len(re.sub(r"\D", "", p.group(0))) <= 15})
+    found_contacts = contacts.run(text=text, page_html=page_html, jsonld=nodes,
+                                  region=region)
 
     identity = {
         "name": person.get("name") or og.get("og:title", "").split(" - ")[0].strip() or h1,
@@ -397,15 +471,34 @@ def extract(page_html: str, base_url: str = "") -> dict:
         "birth_date": person.get("birth_date", ""),
         "image": person.get("image") or og.get("og:image", ""),
     }
+    # Interests: declared in JSON-LD, in the keywords meta tag, or as topic tags
+    # on the page. Weak signal individually, useful when several agree.
+    interests: list[str] = list(person.get("interests", []))
+    for raw in (og.get("keywords", ""), metas.get("article:tag", "")):
+        for kw in re.split(r"[,;|]", raw):
+            kw = kw.strip()
+            if (2 < len(kw) <= 40 and kw.lower() not in _GENERIC_KEYWORDS
+                    and kw.lower() not in {i.lower() for i in interests}):
+                interests.append(kw)
+    for m in re.finditer(r'/topics/([A-Za-z0-9][A-Za-z0-9._-]{1,30})', page_html):
+        tag = m.group(1).replace("-", " ")
+        if (tag.lower() not in _GENERIC_KEYWORDS
+                and tag.lower() not in {i.lower() for i in interests}):
+            interests.append(tag)
+
     return {"identity": {k: v for k, v in identity.items() if v},
-            "links": links, "rel_me": rel_me, "emails": emails, "phones": phones,
+            "links": links, "rel_me": rel_me, "emails": emails,
+            "phones": found_contacts["phones"],
+            "addresses": found_contacts["addresses"],
+            "interests": interests,
             "birth_hints": sorted({m.group(1).strip() for m in _BIRTH_RE.finditer(text)}),
             "jsonld_person": person, "opengraph": og, "title": title, "h1": h1,
             "raw_jsonld_types": sorted({str(n.get("@type", "")) for n in nodes if n.get("@type")}),
             "text_sample": text[:1200]}
 
 
-def run(url: str, *, timeout: float = 20.0, render: bool = False) -> dict:
+def run(url: str, *, timeout: float = 20.0, render: bool = False,
+        region: str = "") -> dict:
     """Fetch a page and extract everything identity-related from it.
 
     Args:
@@ -413,6 +506,7 @@ def run(url: str, *, timeout: float = 20.0, render: bool = False) -> dict:
         timeout: Request timeout in seconds.
         render: Use a headless browser (Playwright) for JS-only pages. Falls
             back to the plain fetch, with a note, if Playwright isn't installed.
+        region: ISO country code for phone/postcode interpretation (e.g. "TR").
 
     Returns:
         The :func:`extract` dict plus ``{"url","final_url","http_status",
@@ -449,7 +543,7 @@ def run(url: str, *, timeout: float = 20.0, render: bool = False) -> dict:
     blocked = False if rendered else fetch.Response(
         u, final, status, body.encode("utf-8", "replace"), None, 0.0).blocked
 
-    res = extract(body, base_url=final or u)
+    res = extract(body, base_url=final or u, region=region)
     res.update({"url": u, "final_url": final, "http_status": status,
                 "blocked": blocked, "rendered": rendered, "note": note})
 
@@ -514,8 +608,19 @@ def _compact_lines(res: dict) -> list[str]:
         lines.append(f"## EMAILS ({len(res['emails'])})")
         lines += [f"  {e}" for e in res["emails"]]
     if res["phones"]:
-        lines.append(f"## PHONE-SHAPED STRINGS ({len(res['phones'])}) — noisy, verify")
-        lines += [f"  {p}" for p in res["phones"]]
+        lines.append(f"## PHONE NUMBERS ({len(res['phones'])}) — validated against E.164")
+        for ph in res["phones"]:
+            kind = f"  [{ph['kind']}]" if ph.get("kind") else ""
+            lines.append(f"  {ph['e164']:<18} {ph['country']:<26} "
+                         f"{ph['confidence']}{kind}")
+    if res.get("addresses"):
+        lines.append(f"## ADDRESSES ({len(res['addresses'])})")
+        for a in res["addresses"]:
+            lines.append(f"  [{a['confidence']}] {a['formatted']}")
+            lines.append(f"      via {a['source']}")
+    if res.get("interests"):
+        lines.append(f"## INTERESTS / TOPICS ({len(res['interests'])})")
+        lines.append("  " + ", ".join(res["interests"][:40]))
     if res["birth_hints"]:
         lines.append("## DATE-OF-BIRTH HINTS (context-matched, verify)")
         lines += [f"  {b}" for b in res["birth_hints"]]
@@ -537,6 +642,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("url", nargs="?", help="Profile or website URL.")
     p.add_argument("--timeout", type=float, default=20.0, help="Timeout (default 20).")
+    p.add_argument("--region", default="",
+                   help="ISO country code for phone/postcode reading (TR, GB, US...).")
     p.add_argument("--render", action="store_true",
                    help="Render JS with Playwright if installed (optional dependency).")
     p.add_argument("--json", action="store_true", help="Emit one complete JSON object.")
@@ -550,7 +657,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help(sys.stderr)
         return 2
     try:
-        res = run(args.url, timeout=args.timeout, render=args.render)
+        res = run(args.url, timeout=args.timeout, render=args.render,
+                  region=args.region)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

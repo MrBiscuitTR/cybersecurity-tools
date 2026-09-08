@@ -115,6 +115,89 @@ def split_name(full_name: str) -> dict[str, object]:
             "last": last, "parts": tokens, "raw": full_name.strip()}
 
 
+def name_key(full_name: str) -> frozenset[str]:
+    """The comparable form of a name: ASCII-folded, lowercased token set.
+
+    ``"Çağan Efe Çalıdağ"`` and ``"cagan calidag"`` both reduce to token sets
+    that overlap, which is what lets :func:`name_matches` recognize them as the
+    same person written two ways.
+    """
+    return frozenset(t for t in re.split(r"[^a-z0-9]+", _ascii_fold(full_name).lower())
+                     if len(t) > 1)
+
+
+def name_matches(a: str, b: str) -> dict[str, object]:
+    """Decide whether two written names plausibly denote the same person.
+
+    Handles the cases that actually occur: diacritics dropped or kept
+    (Çağan/Cagan), a middle name present on one side only, surname-first order,
+    and initials standing in for a full given name.
+
+    Args:
+        a: One spelling.
+        b: The other.
+
+    Returns:
+        ``{"match": bool, "relation": str, "shared": [...], "extra_a": [...],
+        "extra_b": [...]}`` where ``relation`` is one of ``exact``,
+        ``superset`` (b adds names, e.g. a middle name), ``subset``,
+        ``initial``, ``partial`` or ``none``.
+    """
+    ta, tb = name_key(a), name_key(b)
+    if not ta or not tb:
+        return {"match": False, "relation": "none", "shared": [],
+                "extra_a": sorted(ta), "extra_b": sorted(tb)}
+    shared = ta & tb
+    out = {"shared": sorted(shared), "extra_a": sorted(ta - tb),
+           "extra_b": sorted(tb - ta)}
+    if ta == tb:
+        return {**out, "match": True, "relation": "exact"}
+    if ta < tb:
+        # "Cagan Calidag" inside "Cagan Efe Calidag" -> the longer one is fuller.
+        return {**out, "match": True, "relation": "superset"}
+    if tb < ta:
+        return {**out, "match": True, "relation": "subset"}
+    # Initials: every unmatched token on one side is the first letter of an
+    # unmatched token on the other ("C. Calidag" vs "Cagan Calidag").
+    if shared:
+        rest_a, rest_b = ta - tb, tb - ta
+        if rest_a and all(len(x) == 1 and any(y.startswith(x) for y in rest_b)
+                          for x in rest_a):
+            return {**out, "match": True, "relation": "initial"}
+        if rest_b and all(len(x) == 1 and any(y.startswith(x) for y in rest_a)
+                          for x in rest_b):
+            return {**out, "match": True, "relation": "initial"}
+        # At least two shared tokens (given + family) is a real match even when
+        # both sides carry extra names.
+        if len(shared) >= 2:
+            return {**out, "match": True, "relation": "partial"}
+    return {**out, "match": False, "relation": "none"}
+
+
+def fuller_name(current: str, candidate: str) -> str:
+    """Return whichever spelling is the better label for the same person.
+
+    Prefers more name tokens (a middle name is real information), then the
+    spelling that kept its diacritics — ``Çağan Efe Çalıdağ`` is the person's
+    actual name and ``cagan calidag`` is a transliteration of it.
+    """
+    if not candidate.strip():
+        return current
+    if not current.strip():
+        return candidate
+    if not name_matches(current, candidate)["match"]:
+        return current
+    ca, cb = name_key(current), name_key(candidate)
+    if len(cb) != len(ca):
+        return candidate if len(cb) > len(ca) else current
+    a_marks = sum(1 for ch in current if _ascii_fold(ch) != ch)
+    b_marks = sum(1 for ch in candidate if _ascii_fold(ch) != ch)
+    if b_marks != a_marks:
+        return candidate if b_marks > a_marks else current
+    # Same information both ways: prefer the properly capitalized rendering.
+    return candidate if candidate.istitle() and not current.istitle() else current
+
+
 def strip_affixes(handle: str) -> dict[str, object]:
     """Strip decoration from a handle to expose its core, deterministically.
 

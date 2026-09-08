@@ -117,10 +117,75 @@ def test_run_rejects_all_invalid():
 def test_site_table_is_coherent():
     for s in username.SITES:
         assert "{u}" in s.url or s.mode == "manual"
-        assert s.mode in ("status", "text", "manual")
+        assert s.mode in ("status", "text", "meta", "manual")
         if s.mode == "text":
             assert s.exists_text or s.absent_text
         assert s.category in username.CATEGORIES
+
+
+def test_big_social_platforms_are_actually_checked():
+    """Instagram/X/Facebook/TikTok serve public profile metadata — reporting
+    them as unverifiable 'manual' hides accounts that are plainly findable."""
+    modes = {s.name: s.mode for s in username.SITES}
+    for site in ("instagram", "x/twitter", "facebook", "threads", "tiktok",
+                 "twitch", "medium", "pinterest", "snapchat"):
+        assert modes[site] != "manual", f"{site} should be checked, not manual"
+
+
+def _meta_page(title, desc=""):
+    return (f'<meta property="og:title" content="{title}">'
+            f'<meta property="og:description" content="{desc}">').encode()
+
+
+def test_meta_mode_extracts_name_and_stats(monkeypatch):
+    site = username.Site("instagram", "https://ig.test/{u}/", "social", mode="meta")
+    monkeypatch.setattr(username.fetch, "get", lambda *a, **k: _resp(
+        200, _meta_page("Çağan Efe Çalıdağ (@cagancalidag)",
+                        "307 Followers, 377 Following, 0 Posts - See Instagram")))
+    res = username.check_site(site, "cagancalidag")
+    assert res["state"] == "found"
+    assert res["profile_name"] == "Çağan Efe Çalıdağ"
+    assert res["stats"]["follower"] == "307"
+    assert res["stats"]["following"] == "377"
+
+
+def test_meta_mode_absent_when_no_og_title(monkeypatch):
+    site = username.Site("instagram", "https://ig.test/{u}/", "social", mode="meta")
+    monkeypatch.setattr(username.fetch, "get",
+                        lambda *a, **k: _resp(200, b"<html>generic page</html>"))
+    assert username.check_site(site, "nobody")["state"] == "absent"
+
+
+def test_meta_mode_absent_title_patterns(monkeypatch):
+    site = username.Site("threads", "https://th.test/@{u}", "social", mode="meta",
+                         absent_title=("Log in",))
+    monkeypatch.setattr(username.fetch, "get",
+                        lambda *a, **k: _resp(200, _meta_page("Threads • Log in")))
+    assert username.check_site(site, "nobody")["state"] == "absent"
+
+
+def test_text_mode_substitutes_the_handle(monkeypatch):
+    """TikTok's marker is handle-specific: '"uniqueId":"<handle>"'."""
+    site = username.Site("tiktok", "https://tt.test/@{u}", "social", mode="text",
+                         exists_text='"uniqueId":"{u}"')
+    monkeypatch.setattr(username.fetch, "get",
+                        lambda *a, **k: _resp(200, b'x "uniqueId":"realuser" y'))
+    assert username.check_site(site, "realuser")["state"] == "found"
+    assert username.check_site(site, "otheruser")["state"] == "absent"
+
+
+@pytest.mark.parametrize("title,desc,name,stat_key", [
+    ("jack (@jack) on X", "", "jack", None),
+    ("Ninja - Twitch", "Just want to make people happy", "Ninja", None),
+    ("Dan – Medium", "", "Dan", None),
+    ("Mark Zuckerberg (@zuck) • Threads, Say more",
+     "5.7M Followers • 158 Threads", "Mark Zuckerberg", "follower"),
+])
+def test_parse_profile_meta(title, desc, name, stat_key):
+    got_name, stats = username._parse_profile_meta(title, desc)
+    assert got_name == name
+    if stat_key:
+        assert stat_key in stats
 
 
 def test_main_no_args_returns_2():

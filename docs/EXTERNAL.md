@@ -79,6 +79,28 @@ and merged by cross-engine agreement.
 | OpenCorporates | `https://api.opencorporates.com/v0.4/officers/search` | `OPENCORPORATES_API_KEY` |
 | OpenSanctions | `https://api.opensanctions.org/search/default` | `OPENSANCTIONS_API_KEY` |
 
+**Domain infrastructure** (`osint/infra.py`) — wraps `recon/` and `web/`, adds RDAP.
+
+| Source | Endpoint | Notes |
+| --- | --- | --- |
+| RDAP | `https://rdap.org/domain/<d>`, `https://rdap.iana.org/domain/<d>` | registrar, creation/expiry, status, nameservers. Registrant identity is redacted for most TLDs post-GDPR. |
+| RIPEstat | via `recon/asn.py` | IP -> ASN + announced netblocks |
+| DoH resolvers | via `recon/dns_records.py` | A/AAAA/NS/MX/TXT/SOA/CNAME/CAA |
+| TLS handshake | via `web/tls_audit.py` (`--active` only) | cert subject/issuer/SANs -> related domains and the legal org |
+| HTTP probe | via `recon/http_probe.py` (`--active` only) | status, title, server banner, technology guess |
+
+**Corporate ownership** (`osint/records.py`)
+
+| Source | Endpoint | Notes |
+| --- | --- | --- |
+| GLEIF relationships | `https://api.gleif.org/api/v1/lei-records/<lei>/{direct,ultimate}-{parent,children}` | free, no auth. Parent/subsidiary links, self-reported and LOU-validated. A 404 means "no reported parent", not an error. |
+| Companies House | `.../search/companies`, `.../company/<n>/officers` | `COMPANIES_HOUSE_KEY`. Executives with role, nationality, partial DoB, address. |
+
+**No API** (`osint/contacts.py`) — phone and address extraction is pure computation
+over text you already fetched: E.164 validation against the ITU-T calling-code
+table, per-country postcode shapes, schema.org `PostalAddress` and microformats.
+No libphonenumber dependency; anything ambiguous is labelled ambiguous.
+
 **Vehicles** (`osint/vehicle.py`)
 
 | Source | Endpoint | Notes |

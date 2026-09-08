@@ -36,8 +36,22 @@ nothing writes, nothing contacts the subject.
 
   ```bash
   python -m osint.person --name "Ada Lovelace" --employer "Analytical Engines"
+  python -m osint.person --name "Cagan Calidag" --region TR --result-table
   python -m osint.person --handle torvalds --stages username,profile,correlate
   ```
+
+  Two things happen automatically inside it:
+
+  **Name refinement.** You search `cagan calidag`; Instagram's profile metadata
+  says `Çağan Efe Çalıdağ`. Diacritics and middle names are matched across
+  spellings, the seed is rewritten, and the handle sweep re-runs against the
+  corrected name immediately — before the remaining stages continue. Search
+  result titles are used as a fallback when a platform is rate-limiting.
+
+  **Recursive expansion.** Personal sites and link-in-bio pages name accounts no
+  sweep would reach, so discovered profile URLs are queued and extracted too.
+  Only `rel=me` links and links on *personal* sites are followed — a platform
+  profile page's footer links belong to the platform, not the person.
 
 - **[variants.py](variants.py)** — name parts → handle and email candidates,
   ordered so the obvious spellings come first. Offline, instant.
@@ -104,6 +118,23 @@ nothing writes, nothing contacts the subject.
   python -m osint.vehicle --plate "34 ABC 123"
   ```
 
+- **[contacts.py](contacts.py)** — phone numbers and postal addresses, validated
+  rather than regex-matched: E.164 normalization, the real country calling-code
+  table, line-type detection, and a confidence per hit. A national-format number
+  is only reported when a phone word sits near it.
+
+  ```bash
+  python -m osint.contacts --text "call +90 532 123 45 67" --region TR
+  ```
+
+- **[infra.py](infra.py)** — a domain's own graph: RDAP registration, DNS, IPs,
+  netblocks, ASN, TLS certificate and SANs, web technology, subdomains. Wraps the
+  repo's `recon/` and `web/` tools.
+
+  ```bash
+  python -m osint.infra example.com --active
+  ```
+
 - **[fetch.py](fetch.py)** — shared infrastructure: browser-realistic headers
   with UA rotation, redirect chains, cookie jars, anti-bot detection, the
   multi-source `gather()` fan-out, and an optional Playwright renderer.
@@ -123,6 +154,39 @@ websearch --person <name> --extra <city> -> the login-walled platforms
 
 `person.py` automates this loop, but each step remains individually callable so
 you can intervene at any point.
+
+## Entity coverage
+
+The Maltego-style entity classes this package can actually produce, and where
+each comes from:
+
+| Entity | Source |
+| --- | --- |
+| Person, alias, alternate spelling | profile/username metadata, Wikidata, LinkedIn |
+| Email address | Gravatar, git commit metadata, page text, permutation |
+| Phone number | `contacts.py`, E.164-validated with a confidence |
+| Physical address | JSON-LD `PostalAddress`, microformats, free text |
+| Location | profile metadata, LinkedIn, Gravatar |
+| Social profile / handle / ID | ~70 platforms incl. Instagram, X, Facebook, TikTok |
+| Date of birth | Wikidata; page-text hints marked unverified |
+| Employer, education, occupation | LinkedIn JSON-LD, Wikidata |
+| Interests | JSON-LD `knowsAbout`, keywords, topic tags |
+| Breach / leak | XposedOrNot, HIBP, LeakCheck, Hudson Rock (infostealers) |
+| Company registration | Companies House, GLEIF, SEC EDGAR |
+| Parent / subsidiary | GLEIF relationship records |
+| Executives / officers | Companies House, OpenCorporates |
+| Sanctions / PEP | OpenSanctions |
+| Domain, registrar, dates | RDAP |
+| IP, netblock, ASN | DNS + RIPEstat |
+| DNS records | privacy-first DoH |
+| TLS certificate, SANs | `web/tls_audit.py` |
+| Website technology | `recon/http_probe.py` |
+| Vehicle (VIN, plate region) | NHTSA vPIC, built-in plate tables |
+
+`--result-table` prints all of it as one aligned table.
+
+Not achievable and deliberately absent: plate-to-owner, credit files, voter
+rolls, paid people-search brokers, and anything behind a login.
 
 ## Configuration
 

@@ -18,7 +18,8 @@ the second sweep productive. Budget for two or three passes.
   2. osint_username   sweep the candidates you believe in across ~70 platforms
   3. osint_profile    each hit -> real name, bio, location, employer, LINKED ACCOUNTS
   4. back to step 1   with the corrected name/spelling you just learned
-  5. osint_websearch  the login-walled platforms (Instagram/Facebook/Reddit/...)
+  5. osint_websearch  anything the sweep can't reach, and a metadata fallback
+                      when a platform rate-limits you
   6. osint_email      any address found -> Gravatar identity, breaches, git commits
   7. osint_linkedin   career + education history from the public profile
   8. osint_records    Wikidata/registries -> date of birth, education, employers
@@ -99,19 +100,41 @@ INPUT
     lead than one found on 1.
   category: dev/social/pro/creative/blog/gaming/commerce to narrow the sweep.
 
+THE BIG SOCIAL PLATFORMS ARE CHECKED, NOT SKIPPED
+  Instagram, X, Facebook, Threads, TikTok, Twitch, Pinterest, Snapchat and
+  Medium serve OpenGraph metadata for public profiles to unauthenticated
+  requests, and omit it for handles that don't exist. So they are verified
+  properly — and the DISPLAY NAME, BIO and FOLLOWER COUNTS come back with the
+  verdict. Instagram serves that metadata even for PRIVATE accounts: name, bio
+  and counts are public; only the posts are not.
+  The display name is often a fuller spelling than your seed ("cagan calidag" ->
+  "Çağan Efe Çalıdağ"). When you get one, feed it straight back into
+  osint_variants and re-sweep — that is the highest-yield move available.
+
 OUTPUT — five states, and the difference matters
-  FOUND       exists, on a site proven to reject the control handle
+  FOUND       exists, on a site proven to reject the control handle. May carry
+              profile_name / bio / stats.
   UNRELIABLE  the site says yes to everything — a hit here means NOTHING
-  UNKNOWN     blocked (403/429) or errored. NOT the same as absent. Retry or open
-              the URL yourself.
-  MANUAL      login-walled by design (Instagram, X, Facebook, Reddit, ...). The
-              URL is emitted, never a guess. Use osint_websearch to cover these.
+  UNKNOWN     blocked (403/429), errored, or the platform served its generic
+              page. NOT the same as absent. The generic-page case is genuinely
+              ambiguous (no such handle OR you are being rate-limited), so it is
+              never reported as absent — open the URL to settle it.
+  MANUAL      genuinely uncheckable (no addressable profile URL, or a bot wall on
+              every request). The URL is emitted, never a guess.
   absent      counted per handle, not listed individually
+
+RATE LIMITING
+  Handles are checked one at a time per site (parallel ACROSS sites) precisely
+  because firing nine simultaneous requests at Instagram makes it serve the
+  generic page to everything. If you still get many UNKNOWNs, sweep fewer
+  handles or wait.
 
 WHAT TO DO NEXT
   - Run osint_profile on every FOUND url. That is where the actual identity data
     is, and where you find links to accounts the sweep couldn't reach.
-  - Cover the MANUAL platforms with osint_websearch (site:instagram.com "Name").
+  - Cover MANUAL/UNKNOWN platforms with osint_websearch: a search result title
+    ("Full Name (@handle) • Instagram") carries the same metadata and keeps
+    working when the platform itself is rate-limiting you.
   - A hit does NOT prove it's your person. Confirm with the bio before claiming.
 
 FAILURE / RETRY
@@ -335,4 +358,59 @@ HOW TO REPORT IT
 WHAT TO DO NEXT
   Follow `next_steps` in the result. Usually: a better name spelling was found,
   so re-run the seed and username stages with it.
+"""
+
+CONTACTS = """\
+Extract and validate phone numbers and postal addresses from text or HTML.
+
+Phone extraction is a false-positive problem, not a matching problem: any regex
+loose enough to catch a real number also catches order ids, timestamps, prices
+and version strings. So every candidate here is normalized, length-checked
+against E.164, matched against the real country calling-code table, screened for
+non-phone shapes, and scored by the words around it.
+
+INPUT
+  text / file: what to scan (HTML is reduced to text automatically).
+  region: ISO code (TR, GB, US...) for numbers written WITHOUT a country code.
+    A national-format number is only reported when a phone word ("tel",
+    "mobile", "whatsapp") sits near it — a bare 10-digit run is an id or a price
+    far more often than a phone number, so it is dropped rather than guessed.
+
+OUTPUT
+  phones: E.164 form, country, line type where derivable (Turkish 5xx and UK 7xx
+    are mobile), confidence, and the surrounding text so you can check it.
+  addresses: structured JSON-LD PostalAddress and microformats first (high
+    confidence), then free-text matches that needed BOTH a street phrase and a
+    nearby postcode. A bare 5-digit postcode fits the US, Turkey, Germany and
+    France, so the country is reported as ambiguous rather than guessed.
+
+HOW TO REPORT IT
+  Quote the confidence. A "medium" national-format number is a lead to verify,
+  not a fact. Never present an ambiguous postcode country as settled.
+"""
+
+INFRA = """\
+Infrastructure entities for a domain: RDAP registration, DNS, IPs, netblocks,
+ASN, TLS certificate, web technology, subdomains.
+
+WHEN TO USE
+  Whenever a domain turns up — the subject's personal site, an employer's mail
+  domain, a domain from a certificate. The domain is its own entity with its own
+  graph, and it often names the legal organization behind a person.
+
+WHAT COMES BACK
+  RDAP: registrar, creation/expiry dates, status. Registrant name and address
+    are redacted for most TLDs post-GDPR — that is normal, not a failure; the
+    registrar and creation date are still good pivots.
+  DNS/IPs/ASN: the netblock and autonomous system that own the address, via
+    RIPEstat. Cloudflare/Fastly ASNs mean you are seeing a CDN, not the origin.
+  TLS: certificate subject and SANs. SANs name further domains, and the
+    organization field (on OV/EV certs) names a legal entity for osint.records.
+  related_domains: from cert SANs and MX hosts — each is another infra target.
+
+ACTIVE VS PASSIVE
+  Passive by default (DNS, RDAP, third-party APIs only). active=true also
+  connects to the host for HTTP fingerprinting and the TLS handshake — ordinary
+  browser-shaped requests, but still traffic to the target, so only use it on
+  infrastructure the operator is authorized to touch.
 """

@@ -39,7 +39,9 @@ from reversing import firmware as _firmware
 from reversing import gadgets as _gadgets
 from reversing import pwn_template as _pwn_template
 from reversing import symbolic as _symbolic
+from osint import contacts as _contacts
 from osint import email as _osint_email
+from osint import infra as _infra
 from osint import linkedin as _linkedin
 from osint import person as _person
 from osint import profile as _osint_profile
@@ -499,6 +501,26 @@ def build_app(host: str = "127.0.0.1", port: int = 8091, path: str = "/mcp"):
                           email_domain=email_domain, location=location,
                           employer=employer, stages=st)
         return "\n".join(_person._compact_lines(res))
+
+    @app.tool(description=guides_osint.CONTACTS)
+    def osint_contacts(text: str = "", url: str = "", region: str = "") -> str:
+        """Extract validated phone numbers and postal addresses from text, or
+        from a URL's page. `region` (TR/GB/US...) is required to read numbers
+        written without a country code. Returns compact text."""
+        if url:
+            page = _osint_profile.run(url, region=region)
+            res = {"phones": page.get("phones", []),
+                   "addresses": page.get("addresses", [])}
+            return f"# contacts on {url}\n" + "\n".join(_contacts._compact_lines(res))
+        res = _contacts.run(text=text, region=region)
+        return "\n".join(_contacts._compact_lines(res))
+
+    @app.tool(description=guides_osint.INFRA)
+    def osint_infra(domain: str, active: bool = False, subdomains: bool = False) -> str:
+        """Domain infrastructure: RDAP, DNS, IPs, netblocks, ASN, TLS, tech.
+        Passive unless active=true (which connects to the host). Compact text."""
+        res = _infra.run(domain, active=active, subdomains=subdomains)
+        return "\n".join(_infra._compact_lines(res))
 
     return app
 
