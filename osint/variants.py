@@ -185,7 +185,14 @@ def fuller_name(current: str, candidate: str) -> str:
         return current
     if not current.strip():
         return candidate
-    if not name_matches(current, candidate)["match"]:
+    match = name_matches(current, candidate)
+    # Only adopt a spelling that CONTAINS everything we already believe. A
+    # "partial" match shares some tokens but drops others, so adopting it loses
+    # a real name part ("Ece Selin Güngör" -> "Ece Güngör på Snapchat") and
+    # sends every later stage after the wrong person.
+    if match["relation"] not in ("exact", "superset"):
+        return current
+    if name_key(current) - name_key(candidate):
         return current
     ca, cb = name_key(current), name_key(candidate)
     if len(cb) != len(ca):

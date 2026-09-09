@@ -6,8 +6,10 @@ and reports which tier produced the text so a caller knows how much to trust it:
 
     pdftotext   poppler-utils, if installed. Handles font encodings, ToUnicode
                 CMaps, ligatures and column layout properly. Always preferred.
-    builtin     a stdlib content-stream parser (below). No dependencies, works
-                everywhere, good on ordinary text PDFs.
+    pypdf       the pure-Python library (pip install pypdf). Nearly as good, no
+                system package needed. Preferred over the builtin parser.
+    builtin     a stdlib content-stream parser (below). Last resort so the tool
+                still works with no dependencies at all.
     ocr         tesseract, if installed, for PDFs that contain no text layer at
                 all — a scan or an exported image. Without OCR those files are
                 genuinely unreadable, and the tool says so rather than returning
@@ -27,6 +29,9 @@ Why the builtin parser is not just "regex for (...)":
   * Strings come as literals ``(...)`` with octal/backslash escapes, or as hex
     ``<0048...>``, and may be UTF-16BE. All three are handled.
 
+Optional dependencies (everything degrades cleanly without them):
+    pypdf       pip install pypdf
+
 External binaries (both optional, wrapped read-only via ``common.proc``):
     pdftotext   apt install poppler-utils
     tesseract   apt install tesseract-ocr  (plus a language pack, e.g.
@@ -45,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import io
 import re
 import sys
 import tempfile
@@ -261,6 +267,29 @@ def text_builtin(data: bytes) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
+def text_pypdf(data: bytes) -> str:
+    """Extract text with pypdf, when the library is installed.
+
+    A maintained PDF library beats a hand-written parser: it resolves the page
+    tree, filter chains and font encodings properly. Kept optional so the module
+    still functions on a machine with nothing installed.
+    """
+    try:
+        import pypdf
+    except ImportError:
+        return ""
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        if reader.is_encrypted:
+            try:
+                reader.decrypt("")          # many PDFs are "encrypted" with no password
+            except Exception:               # noqa: BLE001 - unreadable, not fatal
+                return ""
+        return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
+    except Exception:                       # noqa: BLE001 - malformed PDFs are common
+        return ""
+
+
 def text_pdftotext(data: bytes, *, timeout: float = 60.0) -> str:
     """Extract text with poppler's ``pdftotext`` if it is installed.
 
@@ -375,16 +404,25 @@ def extract(data: bytes, *, ocr: bool = False, lang: str = "eng",
         return {"text": "", "method": "none", "has_text_layer": False,
                 "image_count": 0, "tools": {}, "note": "not a PDF"}
 
+    try:
+        import pypdf  # noqa: F401
+        have_pypdf = True
+    except ImportError:
+        have_pypdf = False
     tools = {"pdftotext": proc.have("pdftotext"), "tesseract": proc.have("tesseract"),
-             "pdftoppm": proc.have("pdftoppm")}
+             "pdftoppm": proc.have("pdftoppm"), "pypdf": have_pypdf}
     best, method = "", "none"
 
-    if tools["pdftotext"]:
-        best, method = text_pdftotext(data, timeout=timeout), "pdftotext"
-    if len(best.strip()) < 40:
-        builtin = text_builtin(data)
-        if len(builtin.strip()) > len(best.strip()):
-            best, method = builtin, "builtin"
+    # Best available first; each tier only replaces the previous if it actually
+    # produced more text.
+    for name, extractor in (("pdftotext", lambda: text_pdftotext(data, timeout=timeout)),
+                            ("pypdf", lambda: text_pypdf(data)),
+                            ("builtin", lambda: text_builtin(data))):
+        if len(best.strip()) >= 40:
+            break
+        candidate = extractor()
+        if len(candidate.strip()) > len(best.strip()):
+            best, method = candidate, name
 
     has_layer = len(best.strip()) >= 40
     img_count = len(images(data))
@@ -402,10 +440,10 @@ def extract(data: bytes, *, ocr: bool = False, lang: str = "eng",
                        "Install tesseract (apt install tesseract-ocr, plus a "
                        "language pack such as tesseract-ocr-tur) and pass --ocr; "
                        "poppler-utils gives better page rendering."))
-    if method == "builtin" and not tools["pdftotext"]:
+    if method == "builtin" and not (tools["pdftotext"] or tools["pypdf"]):
         note = (note + " " if note else "") + (
-            "using the builtin parser; install poppler-utils for better "
-            "accuracy on unusual fonts")
+            "using the stdlib fallback parser; `pip install pypdf` or "
+            "`apt install poppler-utils` for better accuracy")
 
     return {"text": best, "method": method, "has_text_layer": has_layer,
             "image_count": img_count, "tools": tools, "note": note.strip()}
@@ -453,12 +491,13 @@ def run(source: str, *, ocr: bool = False, lang: str = "eng",
             "addresses": found["addresses"]}
 
 
-def _compact_lines(res: dict) -> list[str]:
+def _compact_lines(res: dict, show_text: bool = False) -> list[str]:
     lines = [f"# pdf: {res['source']}",
              f"# method={res['method']}  chars={res['chars']}  "
              f"text_layer={res['has_text_layer']}  images={res['image_count']}"]
     tools = res.get("tools", {})
-    lines.append(f"# tools: pdftotext={'yes' if tools.get('pdftotext') else 'NO'} "
+    lines.append(f"# tools: pypdf={'yes' if tools.get('pypdf') else 'NO'} "
+                 f"pdftotext={'yes' if tools.get('pdftotext') else 'NO'} "
                  f"pdftoppm={'yes' if tools.get('pdftoppm') else 'NO'} "
                  f"tesseract={'yes' if tools.get('tesseract') else 'NO'}")
     if res.get("note"):
@@ -474,9 +513,11 @@ def _compact_lines(res: dict) -> list[str]:
         lines.append(f"## ADDRESSES ({len(res['addresses'])})")
         for a in res["addresses"]:
             lines.append(f"  [{a['confidence']}] {a['formatted']}")
-    if res["text"]:
-        lines.append("## TEXT (first 2000 chars)")
-        lines.append(res["text"][:2000])
+    if show_text and res["text"]:
+        lines.append("## TEXT")
+        lines.append(res["text"])
+    elif res["text"]:
+        lines.append(f"## TEXT: {res['chars']} chars extracted (pass --text to print it)")
     return lines
 
 
@@ -497,6 +538,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lang", default="eng", help="Tesseract language(s), e.g. eng+tur.")
     p.add_argument("--region", default="", help="ISO code for phone/postcode reading.")
     p.add_argument("--timeout", type=float, default=60.0, help="Timeout (default 60).")
+    p.add_argument("--text", action="store_true",
+                   help="Print the extracted text as well as the findings.")
     p.add_argument("--json", action="store_true", help="Emit one complete JSON object.")
     return p
 
@@ -513,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    emit(res, as_json=args.json, lines=_compact_lines(res))
+    emit(res, as_json=args.json, lines=_compact_lines(res, show_text=args.text))
     return 0
 
 

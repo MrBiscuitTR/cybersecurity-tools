@@ -131,7 +131,9 @@ def run(
     }
     if subdomains:
         from recon import subdomains as subs_mod
-        sources["subdomains"] = lambda: subs_mod.run(d)
+        # resolve=True keeps only live names AND returns their IPs, which is
+        # the point: every distinct address in the person's footprint.
+        sources["subdomains"] = lambda: subs_mod.run(d, resolve=True)
     if active:
         from recon import http_probe
         from web import tls_audit
@@ -190,7 +192,17 @@ def run(
         steps.append("Run with --active for HTTP fingerprinting and the TLS "
                      "certificate (only against hosts you're authorized to touch).")
 
+    # With resolve=True, recon.subdomains returns [{"host","ip"}, ...] — only
+    # names that actually resolve, each with the address it points at.
+    subs_data = got.get("subdomains", {}) or {}
+    raw_subs = subs_data.get("subdomains", []) or []
+    sub_names = sorted({s["host"] if isinstance(s, dict) else str(s)
+                        for s in raw_subs})
+    sub_ips = sorted({s["ip"] for s in raw_subs
+                      if isinstance(s, dict) and s.get("ip")})
+
     return {"domain": d, "rdap": r, "dns": records,
+            "subdomain_ips": sub_ips,
             "nameservers": records.get("NS", []), "mx": records.get("MX", []),
             "ips": ips, "asn": asns,
             "tls": {"subject": cert.get("subject", ""),
@@ -202,7 +214,7 @@ def run(
             "http": {"status": http_res.get("status"), "title": http_res.get("title", ""),
                      "server": http_res.get("server", ""),
                      "tech": http_res.get("tech", [])} if http_res else {},
-            "subdomains": (got.get("subdomains", {}) or {}).get("subdomains", []),
+            "subdomains": sub_names,
             "related_domains": sorted(related),
             "sources_up": sorted(got), "sources_down": down, "next_steps": steps}
 
@@ -257,8 +269,11 @@ def _compact_lines(res: dict) -> list[str]:
         lines.append(f"## RELATED DOMAINS ({len(res['related_domains'])})")
         lines.append("  " + ", ".join(res["related_domains"][:30]))
     if res["subdomains"]:
-        lines.append(f"## SUBDOMAINS ({len(res['subdomains'])})")
-        lines.append("  " + ", ".join(res["subdomains"][:60]))
+        lines.append(f"## SUBDOMAINS ({len(res['subdomains'])}, live)")
+        lines.append("  " + ", ".join(res["subdomains"]))
+    if res.get("subdomain_ips"):
+        lines.append(f"## SUBDOMAIN IPs ({len(res['subdomain_ips'])})")
+        lines.append("  " + ", ".join(res["subdomain_ips"]))
     lines.append("## NEXT")
     lines += [f"  - {s}" for s in res["next_steps"]]
     return lines

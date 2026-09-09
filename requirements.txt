@@ -17,5 +17,10 @@ capstone>=5.0         # reversing/disasm.py --raw and reversing/gadgets.py (ROP 
 # NOTE: pin <2 — an unrelated `mcp` 2.0.0 on PyPI lacks fastmcp. (Or use `fastmcp`.)
 mcp>=1.0,<2
 
+# Optional: PDF text extraction for osint/pdf.py (CVs, certificates, bios).
+# Pure Python, no system packages. Without it the module falls back to
+# poppler's pdftotext when installed, then to a stdlib content-stream parser.
+pypdf>=5.0
+
 # Development
 pytest>=8.3

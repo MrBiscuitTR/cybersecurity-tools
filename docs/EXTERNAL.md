@@ -146,7 +146,7 @@ request to the target host (`tls_audit`). DNS lookups still use the DoH resolver
 | `ripgrep` (rg) | `analyze/bughunt.py`, ad-hoc via `common/safe_bash.py` | `apt install ripgrep` | Fast code search for the vuln sweep. |
 | `git` | `analyze/bughunt.py` (clone), `common/safe_bash.py` | preinstalled | Shallow-clones target repos. |
 | `nuclei` | `recon/nuclei.py` | `apt install nuclei` | Template scanner; run `nuclei -update-templates` once. |
-| `pdftotext`, `pdftoppm` (poppler-utils) | `osint/pdf.py` | `apt install poppler-utils` | **Optional.** Best-quality PDF text (resolves font encodings/ToUnicode CMaps) and page rendering for OCR. A stdlib parser is used when absent. |
+| `pdftotext`, `pdftoppm` (poppler-utils) | `osint/pdf.py` | `apt install poppler-utils` | **Optional.** Best-quality PDF text (resolves font encodings/ToUnicode CMaps) and page rendering for OCR. Falls back to `pypdf`, then a stdlib parser. |
 | `tesseract` | `osint/pdf.py` | `apt install tesseract-ocr` (+ language packs, e.g. `tesseract-ocr-tur`) | **Optional.** OCR for PDFs with no text layer — scans and exported images, which are otherwise unreadable. |
 
 Planned tools will additionally wrap common Kali/RE tooling already on the box:

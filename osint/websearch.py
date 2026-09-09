@@ -15,7 +15,8 @@ Engines (all keyless unless noted):
     startpage         www.startpage.com          generic parser (Google index)
     yahoo             search.yahoo.com           generic parser + RU= decoder
     mojeek            www.mojeek.com             independent index
-    marginalia        old-search.marginalia.nu   indie/non-commercial web
+    marginalia        old-search.marginalia.nu   indie web; OFF by default — it
+                                                 ignores site:/quotes
     searxng           $SEARX_URL or public list  meta-engine: one query covers
                                                  Google/Bing/Brave/Wikipedia at once
     brave_api         api.search.brave.com       needs $BRAVE_API_KEY
@@ -362,6 +363,11 @@ ENGINES = {
 }
 KEYED_ENGINES = {"brave_api": "BRAVE_API_KEY", "serper": "SERPER_API_KEY",
                  "google_cse": "GOOGLE_CSE_KEY", "searxng": "SEARX_URL"}
+# Engines that ignore `site:` and quoted phrases and answer the loose words
+# instead. On a people search that means unrelated forums, videos and adult
+# sites arriving as "results" for a name. Still selectable with --engines when
+# you deliberately want an independent index.
+NON_OPERATOR_ENGINES = {"marginalia"}
 
 
 def person_dorks(name: str, *, handle: str = "", extra: str = "") -> list[str]:
@@ -419,7 +425,8 @@ def search(
         ``agreement`` is how many engines returned that URL.
     """
     chosen = engines or [e for e in ENGINES
-                         if e not in KEYED_ENGINES or os.environ.get(KEYED_ENGINES[e])]
+                         if (e not in KEYED_ENGINES or os.environ.get(KEYED_ENGINES[e]))
+                         and e not in NON_OPERATOR_ENGINES]
     sources = {name: (lambda f=ENGINES[name], q=query, c=count: f(q, c))
                for name in chosen if name in ENGINES}
     got, down = fetch.gather(sources, workers=min(8, len(sources) or 1), timeout=timeout)

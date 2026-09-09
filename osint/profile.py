@@ -214,6 +214,21 @@ def decode_cfemail(token: str) -> str:
     return "".join(chr(b ^ key) for b in raw[1:])
 
 
+# Brand names that appear in profile-page titles. A "name" containing one of
+# these is a page title, not a person.
+_PLATFORM_WORDS = (
+    r"X|Twitter|Instagram|Threads|Facebook|Snapchat|TikTok|LinkedIn|Medium|"
+    r"Pinterest|Twitch|YouTube|Reddit|Mastodon|GitHub|GitLab|Strava|Dribbble|"
+    r"Behance|SoundCloud|Spotify|Steam|Telegram|Tumblr|Flickr|Letterboxd|"
+    r"Goodreads|Quora|Substack|Bluesky|VK|Xing|ResearchGate")
+_PLATFORM_WORD_RE = re.compile(r"(?i)(" + _PLATFORM_WORDS + r")")
+
+
+def contains_platform_word(value: str) -> bool:
+    """True if a candidate name carries a platform's brand name."""
+    return bool(_PLATFORM_WORD_RE.search(value or ""))
+
+
 def clean_title_name(title: str) -> str:
     """Reduce a page title to the person's name.
 
@@ -225,8 +240,15 @@ def clean_title_name(title: str) -> str:
     name = (title or "").strip()
     name = re.split(r"\s+[|·•]\s+|\s+[-–—]\s+", name)[0].strip()
     name = re.sub(r"\s*\(@[^)]*\)\s*", " ", name)
-    name = re.sub(r"\s+on\s+(X|Twitter|Instagram|Threads|Medium|LinkedIn)$", "",
-                  name, flags=re.I)
+    # Pinterest and others render "Real Name (handle)". Keeping the parenthetical
+    # puts the handle's words into the name, so an unrelated "Ece Güzel
+    # (ece_gungor)" starts matching a target called "Ece Güngör".
+    name = re.sub(r"\s*\([A-Za-z0-9._-]{2,40}\)\s*$", "", name)
+    # Platforms localize the suffix: "on Snapchat", "på Snapchat", "su Instagram",
+    # "en Instagram", "sur X". Matching only English left "Ece Güngör på
+    # Snapchat" looking like a person's name.
+    name = re.sub(r"\s+\S{1,4}\s+(" + _PLATFORM_WORDS + r")\s*$", "", name, flags=re.I)
+    name = re.sub(r"\s*[-–—|·•]?\s*(" + _PLATFORM_WORDS + r")\s*$", "", name, flags=re.I)
     name = name.strip(" -–—|·•")
     return "" if name.startswith("@") else name
 

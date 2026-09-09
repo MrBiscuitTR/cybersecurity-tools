@@ -151,10 +151,34 @@ def test_platform_hosts_cover_the_username_table():
     import urllib.parse as up
     from osint import username as u
     for site in u.SITES:
-        host = up.urlparse(site.url.replace("{u}", "x")).netloc.lower()
-        host = host.removeprefix("www.")
-        if host.startswith("x."):
-            host = host[2:]
-        if host:
-            assert person._is_platform_host(host), host
+        host = up.urlparse(site.url.replace("{u}", "handle")).netloc.lower()
+        assert person._is_platform_host(host.removeprefix("www.")), site.url
     assert not person._is_platform_host("simonwillison.net")
+
+
+def test_literal_platform_host_does_not_swallow_its_whole_tld():
+    """x.com is a platform; stripping a leading "x." from it yields "com", after
+    which every .com domain looks like a platform and personal sites vanish."""
+    assert "com" not in person._KNOWN_HOSTS
+    assert person._is_platform_host("x.com")
+    assert not person._is_platform_host("cagancalidag.com")
+    assert not person._is_platform_host("people.epfl.ch")
+
+
+def test_subdomain_templated_platforms_are_matched():
+    """"https://{u}.tumblr.com" must register tumblr.com, not handle.tumblr.com."""
+    assert person._is_platform_host("tumblr.com")
+    assert person._is_platform_host("someone.tumblr.com")
+
+
+@pytest.mark.parametrize("host,ok", [
+    ("cagancalidag.com", True),
+    ("student.tue.nl", True),
+    ("people.epfl.ch", True),
+    ("gmail.com", False),            # mailbox provider, not the subject's
+    ("ali-erens-macbook.local", False),   # mDNS name from git commit metadata
+    ("github.com", False),           # a platform
+    ("notadomain", False),
+])
+def test_is_investigable_domain(host, ok):
+    assert person.is_investigable_domain(host) is ok

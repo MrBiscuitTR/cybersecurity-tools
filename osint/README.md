@@ -146,10 +146,10 @@ nothing writes, nothing contacts the subject.
   ```
 
 - **[pdf.py](pdf.py)** — text and contact details out of PDFs (CVs, certificates,
-  bios). Three tiers, and it tells you which one ran: `pdftotext` when poppler is
-  installed, a stdlib content-stream parser otherwise, and `tesseract` OCR for
-  files with no text layer. Kerned `TJ` fragments are joined without spaces, so
-  an email survives instead of arriving as four pieces.
+  bios). Four tiers, and it reports which one ran: `pdftotext` (poppler) →
+  `pypdf` → a stdlib parser → `tesseract` OCR. A PDF with no text layer is a
+  scan: the tool says so instead of returning binary noise, and OCR is the only
+  way to read it.
 
   ```bash
   python -m osint.pdf https://example.com/cv.pdf --region TR

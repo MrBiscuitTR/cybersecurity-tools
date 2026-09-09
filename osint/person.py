@@ -80,7 +80,8 @@ STAGES = ("seed", "username", "email", "search", "sites", "linkedin", "records",
 _EXTRA_HOSTS = frozenset("""
 wikipedia.org wikidata.org wikimedia.org google.com bing.com yahoo.com
 duckduckgo.com brave.com startpage.com mojeek.com marginalia.nu amazon.com
-apple.com microsoft.com cloudflare.com archive.org
+apple.com microsoft.com cloudflare.com archive.org twitter.com fb.com
+threads.com youtu.be goo.gl bit.ly t.co linktr.ee
 """.split())
 
 
@@ -89,11 +90,17 @@ def _known_hosts() -> frozenset[str]:
     from osint import username as _u
     hosts = set(_EXTRA_HOSTS)
     for site in _u.SITES:
-        host = up.urlparse(site.url.replace("{u}", "x")).netloc.lower()
+        # Strip the handle only for templates where it IS the subdomain
+        # ("https://{u}.tumblr.com"). Substituting first and then removing a
+        # leading "x." turns the literal host "x.com" into "com", after which
+        # every .com domain on earth counts as a platform.
+        template = site.url
+        subdomain_templated = template.startswith(("https://{u}.", "http://{u}."))
+        host = up.urlparse(template.replace("{u}", "handle")).netloc.lower()
         host = host.removeprefix("www.")
-        if host.startswith("x."):      # subdomain-templated (x.tumblr.com)
-            host = host[2:]
-        if host:
+        if subdomain_templated:
+            host = host.split(".", 1)[1] if "." in host else host
+        if host and "." in host:
             hosts.add(host)
     return frozenset(hosts)
 
@@ -147,6 +154,34 @@ def _plausible_birth(hint: str) -> bool:
     """
     years = [int(y) for y in re.findall(r"(?:1[89]|20)\d{2}", hint)]
     return bool(years) and all(1800 <= y <= 2015 for y in years)
+
+
+# Mailbox providers: the domain is the provider's, never the subject's, so
+# profiling it yields Google's infrastructure instead of theirs.
+FREE_MAIL_DOMAINS = frozenset("""
+gmail.com googlemail.com outlook.com hotmail.com live.com msn.com yahoo.com
+ymail.com icloud.com me.com mac.com proton.me protonmail.com pm.me tuta.io
+tutanota.com gmx.com gmx.de web.de mail.ru yandex.ru yandex.com zoho.com
+aol.com fastmail.com hey.com mail.com inbox.com naver.com qq.com 163.com
+""".split())
+# Names that never resolve publicly: mDNS/LAN suffixes that turn up in git
+# commit metadata ("alierentansug@ali-erens-macbook.local").
+_PRIVATE_TLDS = (".local", ".localdomain", ".lan", ".home", ".internal",
+                 ".invalid", ".test", ".localhost", ".arpa")
+
+
+def is_investigable_domain(host: str) -> bool:
+    """True if a domain is worth an infra lookup.
+
+    Excludes mailbox providers (you learn about Google, not the person), private
+    and reserved suffixes, and anything without a dot.
+    """
+    host = (host or "").strip().lower().rstrip(".")
+    if not host or "." not in host or " " in host:
+        return False
+    if host in FREE_MAIL_DOMAINS or host.endswith(_PRIVATE_TLDS):
+        return False
+    return not _is_platform_host(host)
 
 
 def _host_of(url: str) -> str:
@@ -354,6 +389,7 @@ def run(
     max_queries: int = 6,
     depth: int = 2,
     active_infra: bool = False,
+    subdomains: bool = True,
     timeout: float = 20.0,
 ) -> dict:
     """Run the full investigation and correlate everything found.
@@ -374,6 +410,7 @@ def run(
         depth: Profile expansion rounds. 1 = only the URLs already found;
             2 (default) also extracts profiles discovered on those pages.
         active_infra: Let the infra stage connect to hosts (HTTP/TLS).
+        subdomains: Run passive subdomain enumeration for each domain found.
         timeout: Per-request timeout passed to the underlying tools.
 
     Returns:
@@ -440,8 +477,12 @@ def run(
             # A candidate must look like a name, and must not balloon the seed:
             # a title containing the real name is a superset by token test but is
             # not a better label for the person.
+            from osint.profile import clean_title_name, contains_platform_word
+            cand = clean_title_name(cand) or cand
             if not looks_like_a_person_name(cand, min_words=1):
                 continue
+            if contains_platform_word(cand):
+                continue          # "Ece Güngör på Snapchat" is a page title
             if len(variants.name_key(cand)) > len(variants.name_key(name)) + 2:
                 continue
             picked = variants.fuller_name(better, cand)
@@ -705,23 +746,23 @@ def run(
     # --- infra --------------------------------------------------------------
     domains: list[str] = [s["domain"] for s in (out.get("sites") or [])]
     for p in out["profiles"]:
-        host = _host_of(p["url"])
-        if host and not _is_platform_host(host):
-            domains.append(host)
-    for addr in known_emails:
-        dom = addr.split("@")[-1]
-        if dom and not _is_platform_host(dom):
-            domains.append(dom)
+        domains.append(_host_of(p["url"]))
+    domains += [addr.split("@")[-1] for addr in known_emails]
+    for g in out.get("github", []):
+        for e in g.get("emails", []):
+            domains.append(e["email"].split("@")[-1])
+        blog = (g.get("profile") or {}).get("blog", "")
+        if blog:
+            domains.append(_host_of(blog if blog.startswith("http") else f"//{blog}"))
     if email_domain:
         domains.append(email_domain)
-    domains = list(dict.fromkeys(d for d in domains if "." in d))
+    domains = list(dict.fromkeys(d for d in domains if is_investigable_domain(d)))
 
     if "infra" in stages and domains:
         from osint import infra as infra_mod
         log(f"[*] stage infra: profiling {len(domains[:5])} domain(s) ...")
-        personal = {s["domain"] for s in (out.get("sites") or [])}
         sources = {d: (lambda dom=d: infra_mod.run(
-            dom, active=active_infra, subdomains=dom in personal, timeout=timeout))
+            dom, active=active_infra, subdomains=subdomains, timeout=timeout))
             for d in domains[:5]}
         got, _ = fetch.gather(sources, workers=3, timeout=timeout * 5)
         out["infra"] = list(got.values())
@@ -797,8 +838,18 @@ def run(
                 if base:
                     push(f"{base}{v}", platform, str(v), source="wikidata",
                          self_declared=True, declared_by="declared on Wikidata")
+        # A search hit only becomes an account if the URL or title actually
+        # mentions the person. Engines return unrelated videos, subreddits and
+        # spam for a name query, and those were arriving as "LOW" accounts.
+        want = _name_tokens(name)
+        handle_set = {h.lower() for h in sweep_handles}
         for platform, hits in ((out.get("search") or {}).get("by_platform") or {}).items():
             for h in hits[:3]:
+                blob = f"{h['url']} {h.get('title', '')}".lower()
+                relevant = (any(hd in blob for hd in handle_set)
+                            or (want and want <= _name_tokens(blob)))
+                if not relevant:
+                    continue
                 push(h["url"], platform, "", source="websearch",
                      agreement=h.get("agreement", 1))
 
@@ -872,9 +923,14 @@ def run(
         # contribute their own contact address, keywords and post dates.
         def about_target(page: dict) -> bool:
             url_l = page["url"].lower()
-            if any(h.lower() in url_l for h in sweep_handles):
-                return True                      # the URL contains our handle
             pname = (page["identity"] or {}).get("name", "")
+            # A name on the page that ISN'T the target settles it: the handle
+            # matching is a coincidence, and everything on that page (keywords,
+            # emails, dates) belongs to somebody else.
+            if name and pname and not variants.name_matches(pname, name)["match"]:
+                return False
+            if any(h.lower() in url_l for h in sweep_handles):
+                return True                      # our handle, no contrary name
             if name and pname and variants.name_matches(pname, name)["match"]:
                 return True
             if _is_platform_host(_host_of(page["url"])):
@@ -966,7 +1022,10 @@ def run(
             "interest": [i["value"] for i in interests],
             "breach": breaches,
             "domain": [i["domain"] for i in out["infra"]],
-            "ip": sorted({ip for i in out["infra"] for ip in i.get("ips", [])}),
+            "ip": sorted({ip for i in out["infra"]
+                          for ip in i.get("ips", []) + i.get("subdomain_ips", [])}),
+            "subdomain": sorted({s for i in out["infra"]
+                                 for s in i.get("subdomains", [])}),
             "netblock": sorted({pfx for i in out["infra"] for a in i.get("asn", [])
                                 for pfx in a.get("prefixes", [])[:5]}),
             "asn": sorted({a["asn"] for i in out["infra"] for a in i.get("asn", [])}),
@@ -1071,8 +1130,12 @@ def _result_table(res: dict) -> list[str]:
     for inf in res.get("infra", []):
         add("DOMAIN", inf.get("domain", ""),
             (inf.get("rdap") or {}).get("registrar", ""))
-        for ip in inf.get("ips", [])[:6]:
+        for ip in inf.get("ips", []):
             add("IP", ip, inf.get("domain", ""))
+        for sub in inf.get("subdomains", []):
+            add("SUBDOMAIN", sub, inf.get("domain", ""))
+        for ip in inf.get("subdomain_ips", []):
+            add("IP (subdomain)", ip, inf.get("domain", ""))
         for a in inf.get("asn", []):
             add("ASN", a.get("asn", ""), a.get("holder", ""))
             for pfx in a.get("prefixes", [])[:3]:
@@ -1222,6 +1285,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="URLs fetched per profile round (default 12).")
     p.add_argument("--max-queries", type=int, default=6,
                    help="Search dork queries (default 6, run 4 at a time).")
+    p.add_argument("--no-subdomains", action="store_true",
+                   help="Skip subdomain enumeration in the infra stage.")
     p.add_argument("--active-infra", action="store_true",
                    help="Let the infra stage connect to hosts (HTTP/TLS).")
     p.add_argument("--result-table", action="store_true",
@@ -1244,7 +1309,8 @@ def main(argv: list[str] | None = None) -> int:
                   employer=args.employer, region=args.region, stages=stages,
                   max_handles=args.max_handles, max_profiles=args.max_profiles,
                   max_queries=args.max_queries, depth=args.depth,
-                  active_infra=args.active_infra, timeout=args.timeout)
+                  active_infra=args.active_infra,
+                  subdomains=not args.no_subdomains, timeout=args.timeout)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

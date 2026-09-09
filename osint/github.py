@@ -59,6 +59,13 @@ _BOT_RE = re.compile(
     r"copilot)[@\[]|@(?:bots?\.|dependabot\.)")
 
 
+def _name_key(value: str) -> set[str]:
+    """Comparable word tokens of a name, ASCII-folded (Güngör -> gungor)."""
+    from osint.variants import _ascii_fold
+    return {t for t in re.split(r"[^a-z0-9]+", _ascii_fold(value or "").lower())
+            if len(t) > 2}
+
+
 def _is_bot_address(email: str, name: str = "") -> bool:
     """True if this commit identity is automation rather than a person."""
     if _BOT_RE.search(email) or _BOT_RE.search(name or ""):
@@ -87,12 +94,15 @@ def profile(login: str, *, timeout: float = 20.0) -> dict:
         "avatar_url", "html_url") if data.get(k) not in (None, "")}
 
 
-def commit_emails(login: str, *, max_repos: int = 8, per_repo: int = 15,
+def commit_emails(login: str, *, owner_names: frozenset[str] = frozenset(),
+                  max_repos: int = 8, per_repo: int = 15,
                   timeout: float = 20.0) -> dict:
     """Harvest author emails from an account's public commit metadata.
 
     Args:
         login: GitHub username.
+        owner_names: Name tokens belonging to this account (from its profile),
+            used to attribute commits GitHub could not link to the account.
         max_repos: Repositories to inspect, most recently pushed first. Each one
             costs an API call, and unauthenticated callers only get 60/hour.
         per_repo: Commits to read per repository.
@@ -109,25 +119,40 @@ def commit_emails(login: str, *, max_repos: int = 8, per_repo: int = 15,
         return {"emails": [], "user_id": "", "repos_checked": 0}
 
     names = [r.get("full_name") for r in repos if r.get("full_name")][:max_repos]
+    owner_names = set(owner_names) | _name_key(login)
     log(f"[*] github: reading commits from {len(names)} repo(s) of {login}")
 
     def one(full: str) -> list[dict]:
+        # All commits, then filter by attribution. Using ?author= would be
+        # precise but only returns commits GitHub could LINK to the account —
+        # an address configured on a laptop that was never added to the profile
+        # is exactly the one worth finding, and that filter hides it. So keep a
+        # commit when the linked account matches, or when the committer name
+        # matches the account's own name; everything else is a collaborator.
         data, _ = fetch.get_json(
             f"{_API}/repos/{full}/commits?per_page={per_repo}",
             headers=_headers(), timeout=timeout)
         out = []
         for c in data if isinstance(data, list) else []:
             commit = c.get("commit") or {}
+            linked = ((c.get("author") or {}).get("login") or "").lower()
             for role in ("author", "committer"):
                 who = commit.get(role) or {}
                 addr = (who.get("email") or "").strip().lower()
+                who_name = who.get("name", "") or ""
                 # CI and web-UI commits are attributed to service accounts that
                 # belong to nobody. Reporting "vercel[bot]" as the subject's
                 # address is worse than reporting nothing.
-                if not addr or _is_bot_address(addr, who.get("name", "")):
+                if not addr or _is_bot_address(addr, who_name):
                     continue
-                out.append({"email": addr, "name": who.get("name", ""),
-                            "repo": full})
+                if linked == login.lower():
+                    attribution = "linked to the account"
+                elif owner_names and _name_key(who_name) & owner_names:
+                    attribution = f"committed as '{who_name}'"
+                else:
+                    continue          # somebody else's commit in a shared repo
+                out.append({"email": addr, "name": who_name, "repo": full,
+                            "attribution": attribution})
         return out
 
     got, _ = fetch.gather({n: (lambda full=n: one(full)) for n in names},
@@ -138,7 +163,8 @@ def commit_emails(login: str, *, max_repos: int = 8, per_repo: int = 15,
     for hits in got.values():
         for h in hits:
             entry = merged.setdefault(h["email"], {
-                "email": h["email"], "names": [], "repos": [], "kind": "real"})
+                "email": h["email"], "names": [], "repos": [], "kind": "real",
+                "attribution": h.get("attribution", "")})
             if h["name"] and h["name"] not in entry["names"]:
                 entry["names"].append(h["name"])
             if h["repo"] not in entry["repos"]:
@@ -177,18 +203,21 @@ def run(login: str, *, max_repos: int = 8, timeout: float = 20.0) -> dict:
     if not re.match(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$", login):
         raise ValueError(f"not a plausible GitHub username: {login!r}")
 
+    # Profile first: its display name is what lets commit attribution recognize
+    # the owner's own commits when GitHub never linked them to the account.
+    prof = profile(login, timeout=timeout)
+    owner_names = frozenset(_name_key(prof.get("name", "")))
+
     sources = {
-        "profile": lambda: profile(login, timeout=timeout),
-        "commits": lambda: commit_emails(login, max_repos=max_repos, timeout=timeout),
+        "commits": lambda: commit_emails(login, owner_names=owner_names,
+                                         max_repos=max_repos, timeout=timeout),
         "orgs": lambda: fetch.get_json(f"{_API}/users/{login}/orgs",
                                        headers=_headers(), timeout=timeout)[0],
         "repos": lambda: fetch.get_json(
             f"{_API}/users/{login}/repos?per_page=30&sort=pushed",
             headers=_headers(), timeout=timeout)[0],
     }
-    got, down = fetch.gather(sources, workers=4, timeout=timeout * 3)
-
-    prof = got.get("profile", {}) or {}
+    got, down = fetch.gather(sources, workers=3, timeout=timeout * 3)
     commits = got.get("commits", {}) or {}
     repos = [r for r in (got.get("repos") or []) if isinstance(r, dict)]
     orgs = [{"login": o.get("login", ""), "url": o.get("url", "")}
@@ -260,7 +289,8 @@ def _compact_lines(res: dict) -> list[str]:
         lines.append(f"## EMAILS FROM COMMIT METADATA ({len(res['emails'])})")
         for e in res["emails"]:
             tag = "REAL" if e["kind"] == "real" else "noreply proxy"
-            lines.append(f"  [{tag}] {e['email']}")
+            lines.append(f"  [{tag}] {e['email']}"
+                         + (f"   ({e['attribution']})" if e.get("attribution") else ""))
             if e["names"]:
                 lines.append(f"           committed as: {', '.join(e['names'])}")
             lines.append(f"           in: {', '.join(e['repos'][:4])}")
