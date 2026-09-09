@@ -85,9 +85,11 @@ nothing writes, nothing contacts the subject.
   python -m osint.email someone@example.com
   ```
 
-- **[websearch.py](websearch.py)** — 12 search engines in parallel, merged and
-  ranked by cross-engine agreement. `--person` runs the social dork set, which
-  is the only honest way to cover Instagram/Facebook/Pinterest/Reddit.
+- **[websearch.py](websearch.py)** — four keyless engines (SearXNG, both
+  DuckDuckGo endpoints, Bing), merged and ranked by cross-engine agreement.
+  Dork groups for identity/contact/documents/academic hunting, `site:` dorks to
+  mine a discovered domain, contact details mined straight out of result
+  snippets, and results that mention neither the name nor a handle are dropped.
 
   ```bash
   python -m osint.websearch --person "Ada Lovelace" --extra "Istanbul"
@@ -215,8 +217,7 @@ Everything works with **no keys at all**. Optional keys unlock extra sources:
 
 | Env var | Unlocks |
 | --- | --- |
-| `SEARX_URL` | Your own SearXNG instance (best single upgrade — see below) |
-| `BRAVE_API_KEY` / `SERPER_API_KEY` / `GOOGLE_CSE_KEY`+`GOOGLE_CSE_CX` | Keyed search engines |
+| `SEARX_URL` | Your own SearXNG instance — the only free route to Google's index |
 | `GITHUB_TOKEN` | Reliable GitHub commit-email search (unauthenticated is throttled) |
 | `HIBP_API_KEY` / `RAPIDAPI_KEY` | HaveIBeenPwned, BreachDirectory |
 | `COMPANIES_HOUSE_KEY` / `OPENCORPORATES_API_KEY` / `OPENSANCTIONS_API_KEY` | Company officers, sanctions/PEP screening |

@@ -83,6 +83,40 @@ def test_search_merges_and_ranks_by_agreement(monkeypatch):
     assert res["engines_down"] == {"e3": "no results"}
 
 
+def test_only_keyless_engines_remain():
+    """Engines that ignore site:/quotes returned unrelated forums and adult
+    sites for a person's name; keyed engines are out of scope for this repo."""
+    assert set(websearch.ENGINES) == {"searxng", "duckduckgo_html",
+                                      "duckduckgo_lite", "bing"}
+    assert not hasattr(websearch, "KEYED_ENGINES")
+
+
+def test_dorks_cover_contact_and_document_hunting():
+    d = websearch.person_dorks("Ada Lovelace", kinds=("contact", "documents"),
+                               social=False)
+    joined = " ".join(d)
+    assert "email" in joined and "filetype:pdf" in joined
+    assert all('"Ada Lovelace"' in q for q in d)
+
+
+def test_site_dorks_mine_a_discovered_domain():
+    d = websearch.site_dorks("epfl.ch", "Ada Lovelace")
+    assert any("site:epfl.ch" in q and "filetype:pdf" in q for q in d)
+    assert websearch.site_dorks("epfl.ch") == []
+
+
+def test_contacts_are_mined_from_snippets():
+    """Engines print the address in the snippet, so a contact dork often needs
+    no page fetch at all."""
+    results = [{"url": "https://acme.dev/team",
+                "title": "Ada Lovelace",
+                "snippet": "Reach Ada at ada.lovelace@acme.dev or +90 532 123 45 67"}]
+    found = websearch.contacts_in_results(results, region="TR")
+    assert found["emails"][0]["email"] == "ada.lovelace@acme.dev"
+    assert found["emails"][0]["sources"] == ["https://acme.dev/team"]
+    assert found["phones"][0]["e164"] == "+905321234567"
+
+
 def test_person_dorks_cover_every_social_platform():
     dorks = websearch.person_dorks("Ada Lovelace", handle="ada")
     joined = " ".join(dorks)
@@ -95,13 +129,6 @@ def test_person_dorks_include_extra_terms():
     d = websearch.person_dorks("Ada Lovelace", extra='"Acme"')
     assert any('"Acme"' in q for q in d)
 
-
-def test_keyed_engines_skipped_without_env(monkeypatch):
-    for var in websearch.KEYED_ENGINES.values():
-        monkeypatch.delenv(var, raising=False)
-    assert websearch._brave_api("q", 10) == []
-    assert websearch._google_cse("q", 10) == []
-    assert websearch._serper("q", 10) == []
 
 
 def test_searxng_uses_configured_instance_first(monkeypatch):

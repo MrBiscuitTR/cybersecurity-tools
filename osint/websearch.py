@@ -7,25 +7,22 @@ many-sources design as ``recon.subdomains``. A URL returned by four engines is a
 much stronger signal than one returned by one, and that agreement count is
 reported.
 
-Engines (all keyless unless noted):
+Engines — four, all keyless, kept because they actually answer:
+
+    searxng           $SEARX_URL or public instances. A meta-engine: one query
+                      reaches Google, Bing, Brave, Wikipedia and more at once.
+                      By far the most valuable, and the only free route to
+                      Google's index. Point it at your own instance.
     duckduckgo_html   html.duckduckgo.com/html   precise parser
     duckduckgo_lite   lite.duckduckgo.com/lite   precise parser
-    bing              www.bing.com               generic parser + ck/a decoder
-    brave             search.brave.com           generic parser
-    startpage         www.startpage.com          generic parser (Google index)
-    yahoo             search.yahoo.com           generic parser + RU= decoder
-    mojeek            www.mojeek.com             independent index
-    marginalia        old-search.marginalia.nu   indie web; OFF by default — it
-                                                 ignores site:/quotes
-    searxng           $SEARX_URL or public list  meta-engine: one query covers
-                                                 Google/Bing/Brave/Wikipedia at once
-    brave_api         api.search.brave.com       needs $BRAVE_API_KEY
-    google_cse        customsearch.googleapis.com  needs $GOOGLE_CSE_KEY + $GOOGLE_CSE_CX
-    serper            google.serper.dev          needs $SERPER_API_KEY
+    bing              www.bing.com               independent index
 
-Keyed engines are used automatically when the env var is present and skipped
-silently when it isn't — so this degrades from "twelve engines" to "eight" rather
-than failing.
+Engines removed after measuring them on real person queries: mojeek (403s, then
+one unrelated hit), marginalia and others that ignore `site:` and quoted phrases
+and answer the loose words instead — which is how unrelated forums, videos and
+adult sites arrived as "results" for somebody's name. Startpage, Brave and Yahoo
+returned nothing parseable at all (consent walls and captchas). Keyed engines
+were dropped entirely: this package stays keyless.
 
 Also builds the dork sets that make people-search work: ``--person`` runs the
 name against every major social platform with ``site:`` restrictions, which is
@@ -56,6 +53,7 @@ import urllib.parse as up
 
 from common.output import emit, log
 from osint import fetch
+from osint.variants import _ascii_fold as _fold
 
 # Social platforms worth a site:-restricted query in --person mode. These are
 # exactly the platforms that block direct profile probing but are indexed.
@@ -187,10 +185,17 @@ def _parse_ddg_lite(page: str) -> list[dict]:
 
 
 def _search_html(name: str, url: str, host: str, parser=None, **kw) -> list[dict]:
+    """Fetch one engine's result page and parse it.
+
+    A dedicated parser takes only the page; the generic one also needs the
+    engine's own host so it can drop navigation. Calling a dedicated parser with
+    both arguments raised TypeError, which `gather` swallowed as "source down" —
+    so both DuckDuckGo engines silently returned nothing.
+    """
     r = fetch.get(url, timeout=kw.pop("timeout", 18.0), retries=1, **kw)
     if not r.ok or r.blocked:
         return []
-    results = (parser or _parse_generic)(r.text, host) if parser else _parse_generic(r.text, host)
+    results = parser(r.text) if parser else _parse_generic(r.text, host)
     for i, res in enumerate(results):
         res["engine"], res["rank"] = name, i + 1
     return results
@@ -216,40 +221,15 @@ def _bing(q: str, n: int) -> list[dict]:
                         "bing.com")
 
 
-def _brave(q: str, n: int) -> list[dict]:
-    return _search_html("brave", f"https://search.brave.com/search?q={up.quote(q)}",
-                        "brave.com")
 
 
-def _startpage(q: str, n: int) -> list[dict]:
-    return _search_html("startpage",
-                        f"https://www.startpage.com/sp/search?query={up.quote(q)}",
-                        "startpage.com")
 
 
-def _yahoo(q: str, n: int) -> list[dict]:
-    return _search_html("yahoo", f"https://search.yahoo.com/search?p={up.quote(q)}",
-                        "yahoo.com")
 
-
-def _mojeek(q: str, n: int) -> list[dict]:
-    return _search_html("mojeek", f"https://www.mojeek.com/search?q={up.quote(q)}",
-                        "mojeek.com")
-
-
-def _marginalia(q: str, n: int) -> list[dict]:
-    return _search_html("marginalia",
-                        f"https://old-search.marginalia.nu/search?query={up.quote(q)}",
-                        "marginalia.nu")
-
-
-# Public SearXNG instances that returned parseable results when last checked
-# (2026-09). A SearXNG instance is itself a meta-engine — one query there fans
-# out to Google, Bing, Brave, Wikipedia and more without any API key — so it is
-# the single highest-value engine in this list. Public instances are volatile:
-# they rate-limit hard (HTTP 429), disable the JSON API, and disappear, which is
-# why several are tried in random order. Point $SEARX_URL at your own instance
-# to skip all of that.
+# Public SearXNG instances that returned parseable results when last checked.
+# A SearXNG instance is itself a meta-engine — one query fans out to Google,
+# Bing, Brave and more with no API key — which makes it the most valuable
+# source here. Public ones rate-limit hard, so point $SEARX_URL at your own.
 PUBLIC_SEARXNG = (
     "https://opnxng.com",
     "https://paulgo.io",
@@ -260,6 +240,11 @@ PUBLIC_SEARXNG = (
     "https://baresearch.org",
     "https://search.hbubli.cc",
 )
+
+# Upstream engines that failed on the last SearXNG query, so an operator can see
+# WHY a search came back thin: "3 results" usually means Brave and DuckDuckGo
+# were captcha'd, not that the person has no footprint.
+_SEARX_UNRESPONSIVE: dict[str, str] = {}
 
 
 def _parse_searxng(page: str, _host: str = "") -> list[dict]:
@@ -287,26 +272,50 @@ def _parse_searxng(page: str, _host: str = "") -> list[dict]:
 
 
 def _searxng(q: str, n: int) -> list[dict]:
-    """SearXNG — a meta-engine, so one query here covers many upstream engines.
+    """SearXNG — a meta-engine, so one query reaches many upstreams at once.
 
     Uses $SEARX_URL when set (comma-separate several; a local instance such as
     ``http://localhost:8080`` is ideal — no rate limits, and you can enable the
-    JSON API). Otherwise falls back to public instances in random order. JSON is
-    tried first and HTML parsed when the instance has JSON disabled, which most
-    public ones do.
+    JSON API and whichever upstream engines you want). Otherwise falls back to
+    public instances in random order.
+
+    The query parameters matter more than they look:
+      ``language=all``      the default auto-detection guesses a language from
+                            the query and then filters results to it, which
+                            quietly discards most hits for a foreign name.
+      ``categories=general``keeps images/news/maps engines out of the way.
+      ``safesearch=0``      SearXNG's filter drops legitimate results (and does
+                            nothing about the junk that unrelated engines
+                            return anyway).
+      ``time_range=``       explicitly unbounded.
     """
     configured = [u.strip().rstrip("/") for u in
                   os.environ.get("SEARX_URL", "").split(",") if u.strip()]
-    instances = configured or random.sample(PUBLIC_SEARXNG, k=min(4, len(PUBLIC_SEARXNG)))
+    instances = configured or random.sample(
+        PUBLIC_SEARXNG, k=min(4, len(PUBLIC_SEARXNG)))
+    params = ("&categories=general&language=all&time_range=&safesearch=0"
+              f"&pageno=1")
 
     for base in instances:
-        data, _ = fetch.get_json(f"{base}/search?q={up.quote(q)}&format=json", timeout=18)
+        url = f"{base}/search?q={up.quote(q)}"
+        data, _ = fetch.get_json(url + "&format=json" + params, timeout=20)
         if isinstance(data, dict) and data.get("results"):
-            return [{"url": it.get("url", ""), "title": _clean_html(it.get("title", "")),
-                     "snippet": _clean_html(it.get("content", "")),
-                     "engine": "searxng", "rank": i + 1}
-                    for i, it in enumerate(data["results"][:n]) if it.get("url")]
-        r = fetch.get(f"{base}/search?q={up.quote(q)}", timeout=18, retries=0)
+            # Report which upstreams failed: "3 results" usually means Brave and
+            # DuckDuckGo were captcha'd, not that the person doesn't exist.
+            for engine, reason in (data.get("unresponsive_engines") or []):
+                _SEARX_UNRESPONSIVE[str(engine)] = str(reason)
+            out = []
+            for i, it in enumerate(data["results"][:n]):
+                if not it.get("url"):
+                    continue
+                out.append({"url": it["url"],
+                            "title": _clean_html(it.get("title", "")),
+                            "snippet": _clean_html(it.get("content", "")),
+                            "engine": "searxng", "rank": i + 1,
+                            "upstream": ",".join(it.get("engines", []))})
+            if out:
+                return out
+        r = fetch.get(url + params, timeout=20, retries=0)
         if r.ok and not r.blocked:
             hits = _parse_searxng(r.text)
             if hits:
@@ -315,92 +324,136 @@ def _searxng(q: str, n: int) -> list[dict]:
                 return hits[:n]
     return []
 
-
-def _brave_api(q: str, n: int) -> list[dict]:
-    key = os.environ.get("BRAVE_API_KEY", "")
-    if not key:
-        return []
-    data, _ = fetch.get_json(
-        f"https://api.search.brave.com/res/v1/web/search?q={up.quote(q)}&count={min(n, 20)}",
-        headers={"X-Subscription-Token": key, "Accept": "application/json"}, timeout=20)
-    items = (data or {}).get("web", {}).get("results", [])
-    return [{"url": it.get("url", ""), "title": _clean_html(it.get("title", "")),
-             "snippet": _clean_html(it.get("description", "")),
-             "engine": "brave_api", "rank": i + 1} for i, it in enumerate(items)]
-
-
-def _google_cse(q: str, n: int) -> list[dict]:
-    key, cx = os.environ.get("GOOGLE_CSE_KEY", ""), os.environ.get("GOOGLE_CSE_CX", "")
-    if not (key and cx):
-        return []
-    data, _ = fetch.get_json(
-        "https://customsearch.googleapis.com/customsearch/v1"
-        f"?key={key}&cx={cx}&q={up.quote(q)}&num={min(n, 10)}", timeout=20)
-    return [{"url": it.get("link", ""), "title": it.get("title", ""),
-             "snippet": it.get("snippet", ""), "engine": "google_cse", "rank": i + 1}
-            for i, it in enumerate((data or {}).get("items", []))]
-
-
-def _serper(q: str, n: int) -> list[dict]:
-    key = os.environ.get("SERPER_API_KEY", "")
-    if not key:
-        return []
-    import json as _json
-    data, _ = fetch.get_json(
-        "https://google.serper.dev/search",
-        headers={"X-API-KEY": key, "Content-Type": "application/json"},
-        data=_json.dumps({"q": q, "num": min(n, 20)}).encode(), timeout=20)
-    return [{"url": it.get("link", ""), "title": it.get("title", ""),
-             "snippet": it.get("snippet", ""), "engine": "serper", "rank": i + 1}
-            for i, it in enumerate((data or {}).get("organic", []))]
-
-
 ENGINES = {
-    "duckduckgo_html": _ddg_html, "duckduckgo_lite": _ddg_lite, "bing": _bing,
-    "brave": _brave, "startpage": _startpage, "yahoo": _yahoo, "mojeek": _mojeek,
-    "marginalia": _marginalia, "searxng": _searxng, "brave_api": _brave_api,
-    "google_cse": _google_cse, "serper": _serper,
+    "searxng": _searxng,
+    "duckduckgo_html": _ddg_html,
+    "duckduckgo_lite": _ddg_lite,
+    "bing": _bing,
 }
-KEYED_ENGINES = {"brave_api": "BRAVE_API_KEY", "serper": "SERPER_API_KEY",
-                 "google_cse": "GOOGLE_CSE_KEY", "searxng": "SEARX_URL"}
-# Engines that ignore `site:` and quoted phrases and answer the loose words
-# instead. On a people search that means unrelated forums, videos and adult
-# sites arriving as "results" for a name. Still selectable with --engines when
-# you deliberately want an independent index.
-NON_OPERATOR_ENGINES = {"marginalia"}
 
 
-def person_dorks(name: str, *, handle: str = "", extra: str = "") -> list[str]:
+# Dork templates. {n} = the quoted name, {h} = a quoted handle, {x} = extra
+# disambiguating terms. Grouped so a caller can ask for just what it needs.
+DORKS: dict[str, tuple[str, ...]] = {
+    "identity": (
+        "{n} {x}",
+        "{n} {x} (bio OR profile OR about)",
+    ),
+    "contact": (
+        # The point of these is the SNIPPET: engines print the address next to
+        # the name, so a hit is often all you need without opening the page.
+        '{n} {x} (email OR e-mail OR contact OR "mail")',
+        '{n} {x} ("@gmail.com" OR "@outlook.com" OR "@hotmail.com" OR "@icloud.com")',
+        "{n} {x} (phone OR tel OR mobile OR whatsapp OR iletisim)",
+    ),
+    "documents": (
+        # A CV is where a phone number and a postal address actually live.
+        "{n} {x} (cv OR resume OR curriculum vitae) filetype:pdf",
+        "{n} {x} filetype:pdf",
+        "{n} {x} (filetype:doc OR filetype:docx OR filetype:pptx)",
+    ),
+    "academic": (
+        # How a university staff/student page gets found. These pages routinely
+        # publish an institutional address and a phone extension.
+        "{n} {x} (site:edu OR site:ac.uk OR site:edu.tr OR site:ac.jp)",
+        "{n} {x} (university OR student OR phd OR researcher OR lab OR thesis)",
+        "{n} {x} (orcid OR scholar OR researchgate OR publication)",
+    ),
+    "professional": (
+        "{n} {x} (cv OR portfolio OR freelance OR consultant)",
+        "{n} {x} (company OR founder OR director OR engineer)",
+    ),
+}
+
+
+def person_dorks(
+    name: str,
+    *,
+    handle: str = "",
+    extra: str = "",
+    kinds: tuple[str, ...] = ("identity", "contact", "documents", "academic"),
+    social: bool = True,
+) -> list[str]:
     """Build the query set for finding a person.
 
     Args:
         name: Full name; quoted as a phrase so engines don't split it.
         handle: A known username, searched bare and across social sites.
-        extra: Extra terms (employer, city, school) ANDed into the general
-            queries — this is what turns 10,000 "John Smith" hits into 5.
+        extra: Extra terms (employer, city, school) ANDed in — this is what
+            turns 10,000 "John Smith" hits into 5.
+        kinds: Which template groups from ``DORKS`` to use.
+        social: Also emit one ``site:`` query per major platform.
 
     Returns:
-        Query strings, general first then site-restricted per platform.
+        Query strings, most valuable first.
     """
     n = f'"{name.strip()}"' if name.strip() else ""
-    ex = f" {extra.strip()}" if extra.strip() else ""
+    h = f'"{handle.strip()}"' if handle.strip() else ""
+    x = extra.strip()
     out: list[str] = []
-    if n:
-        out += [f"{n}{ex}", f"{n}{ex} (cv OR resume OR bio OR profile)",
-                f"{n}{ex} (email OR contact OR @)"]
-    if handle:
-        out += [f'"{handle}"{ex}', f'"{handle}" (profile OR account OR github)']
-    for _, site in SOCIAL_SITES:
-        term = n or f'"{handle}"'
-        if not term:
-            continue
-        out.append(f"site:{site} {term}{ex}" if " OR " not in site
-                   else f"(site:{site}) {term}{ex}")
-    if handle:
-        for _, site in SOCIAL_SITES[:8]:
-            if " OR " not in site:
-                out.append(f'site:{site} "{handle}"')
+
+    def add(q: str) -> None:
+        q = re.sub(r"\s{2,}", " ", q).strip()
+        if q and q not in out:
+            out.append(q)
+
+    for kind in kinds:
+        for tpl in DORKS.get(kind, ()):
+            if "{n}" in tpl and not n:
+                continue
+            add(tpl.format(n=n, h=h, x=x))
+    if h:
+        add(f"{h} {x}")
+        add(f"{h} (email OR contact OR profile)")
+    if social:
+        for _, site in SOCIAL_SITES:
+            term = n or h
+            if not term:
+                continue
+            add(f"site:{site} {term} {x}" if " OR " not in site
+                else f"(site:{site}) {term} {x}")
     return out
+
+
+def contacts_in_results(results: list[dict], *, region: str = "") -> dict:
+    """Mine emails and phone numbers straight out of result titles/snippets.
+
+    Engines print the matched text around the query, so a contact dork often
+    shows the address in the snippet itself — no page fetch needed, and it works
+    even when the page blocks us. Every hit records the URL it came from.
+    """
+    from osint import contacts as _contacts
+    from osint.profile import _EMAIL_RE, _plausible_email
+
+    emails: dict[str, list[str]] = {}
+    phones: dict[str, dict] = {}
+    for r in results:
+        blob = f"{r.get('title', '')} {r.get('snippet', '')}"
+        for addr in {e.lower() for e in _EMAIL_RE.findall(blob)}:
+            if _plausible_email(addr):
+                emails.setdefault(addr, [])
+                if r["url"] not in emails[addr]:
+                    emails[addr].append(r["url"])
+        for ph in _contacts.phones(blob, region=region):
+            entry = phones.setdefault(ph["e164"], {**ph, "sources": []})
+            if r["url"] not in entry["sources"]:
+                entry["sources"].append(r["url"])
+    return {"emails": [{"email": a, "sources": s} for a, s in sorted(emails.items())],
+            "phones": sorted(phones.values(), key=lambda x: x["e164"])}
+
+
+def site_dorks(domain: str, name: str = "", handle: str = "") -> list[str]:
+    """Queries that mine one domain once it is known to be relevant.
+
+    After a university or employer domain turns up, asking the engines what
+    else it publishes about the person is far cheaper than crawling it.
+    """
+    who = f'"{name}"' if name else (f'"{handle}"' if handle else "")
+    if not who:
+        return []
+    return [f"site:{domain} {who}",
+            f"site:{domain} {who} (email OR contact OR tel OR phone)",
+            f"site:{domain} {who} filetype:pdf"]
 
 
 def search(
@@ -424,9 +477,7 @@ def search(
         Each result has ``url,title,snippet,engines,agreement,best_rank`` where
         ``agreement`` is how many engines returned that URL.
     """
-    chosen = engines or [e for e in ENGINES
-                         if (e not in KEYED_ENGINES or os.environ.get(KEYED_ENGINES[e]))
-                         and e not in NON_OPERATOR_ENGINES]
+    chosen = engines or list(ENGINES)
     sources = {name: (lambda f=ENGINES[name], q=query, c=count: f(q, c))
                for name in chosen if name in ENGINES}
     got, down = fetch.gather(sources, workers=min(8, len(sources) or 1), timeout=timeout)
@@ -467,6 +518,8 @@ def run(
     count: int = 20,
     max_queries: int = 12,
     timeout: float = 45.0,
+    region: str = "",
+    kinds: tuple[str, ...] = ("identity", "contact", "documents", "academic"),
 ) -> dict:
     """Search for a raw query, or run the full person dork set.
 
@@ -479,6 +532,8 @@ def run(
         count: Results per engine per query.
         max_queries: Cap on dork queries executed (4 run concurrently).
         timeout: Per-query wall-clock budget.
+        region: ISO code so phone numbers in snippets can be read.
+        kinds: Dork groups to use (see ``DORKS``).
 
     Returns:
         ``{"mode","queries","results","by_platform","engines_used",
@@ -491,7 +546,8 @@ def run(
         raise ValueError("give a query, --person, or --handle")
 
     queries = ([query] if query and not (person or handle)
-               else person_dorks(person, handle=handle, extra=extra)[:max_queries])
+               else person_dorks(person, handle=handle, extra=extra,
+                                 kinds=kinds)[:max_queries])
 
     all_results: dict[str, dict] = {}
     used: set[str] = set()
@@ -502,12 +558,14 @@ def run(
     # set with a 45s budget each could take over five minutes — almost all of it
     # spent waiting. Concurrency is kept modest (4) because every query hits the
     # same engines, and hammering them is how you get rate-limited.
+    # 2 at a time, not 4: the same engines answer every query, and firing four
+    # at once is what pushes DuckDuckGo into a captcha mid-run.
     log(f"[*] {len(queries)} queries across "
-        f"{len(engines or ENGINES)} engines, 4 at a time ...")
+        f"{len(engines or ENGINES)} engines, 2 at a time ...")
     per_q = {q: (lambda query=q: search(query, engines=engines, count=count,
                                         timeout=timeout))
              for q in queries}
-    got, q_down = fetch.gather(per_q, workers=4, timeout=timeout * 3)
+    got, q_down = fetch.gather(per_q, workers=2, timeout=timeout * 4)
 
     for q in queries:
         res = got.get(q)
@@ -532,6 +590,28 @@ def run(
     results = sorted(all_results.values(),
                      key=lambda r: (-r["agreement"], r["best_rank"], r["url"]))
 
+    # Relevance filter for person mode. Engines that ignore quoted phrases
+    # answer the loose words instead: searching "Ece Selin Güngör" returns a
+    # French engineering school called ECE. A result that mentions neither the
+    # name nor a handle anywhere is not a result.
+    dropped = 0
+    if person or handle:
+        want = {t for t in re.split(r"[^a-z0-9]+", _fold(person).lower()) if len(t) > 2}
+        handles = {h.lower() for h in ([handle] if handle else []) if h}
+        kept = []
+        for r in results:
+            blob = f"{r['url']} {r.get('title', '')} {r.get('snippet', '')}".lower()
+            blob_tokens = {t for t in re.split(r"[^a-z0-9]+", _fold(blob)) if len(t) > 2}
+            # Two name tokens (given + family) is the same bar used elsewhere:
+            # requiring ALL of them drops "Ece Güngör" for a target written
+            # "Ece Selin Güngör", which is the same person.
+            enough = want and len(want & blob_tokens) >= min(2, len(want))
+            if enough or any(h in blob for h in handles):
+                kept.append(r)
+            else:
+                dropped += 1
+        results = kept
+
     by_platform: dict[str, list[dict]] = {}
     for r in results:
         host = up.urlparse(r["url"]).netloc.lower().removeprefix("www.")
@@ -552,9 +632,22 @@ def run(
     if down:
         steps.append(f"Engines down this run: {', '.join(sorted(down))} — retry "
                      "later, the mix changes constantly.")
+    found_contacts = contacts_in_results(results, region=region)
+    if found_contacts["emails"]:
+        steps.insert(0, f"{len(found_contacts['emails'])} address(es) appear in the "
+                        "result snippets themselves — check `contacts.emails`.")
+    if _SEARX_UNRESPONSIVE:
+        steps.append("SearXNG upstreams that failed: "
+                     + ", ".join(f"{k} ({v})" for k, v in
+                                 list(_SEARX_UNRESPONSIVE.items())[:6])
+                     + ". Thin results usually mean this, not an absent target.")
+
     return {"mode": "person" if (person or handle) else "query",
             "person": person, "handle": handle, "queries": per_query,
             "results": results, "by_platform": by_platform,
+            "contacts": found_contacts,
+            "dropped_irrelevant": dropped,
+            "searx_unresponsive": dict(_SEARX_UNRESPONSIVE),
             "engines_used": sorted(used), "engines_down": down,
             "total_unique": len(results), "next_steps": steps}
 
@@ -566,6 +659,9 @@ def _compact_lines(res: dict) -> list[str]:
     if res["engines_down"]:
         lines.append(f"# engines down: {', '.join(sorted(res['engines_down']))}")
     lines.append(f"# queries run: {len(res['queries'])}")
+    if res.get("dropped_irrelevant"):
+        lines.append(f"# dropped {res['dropped_irrelevant']} result(s) that mention "
+                     "neither the name nor a handle (engines ignoring quotes)")
 
     if res["by_platform"]:
         lines.append("## SOCIAL PROFILES FOUND (by platform)")
@@ -574,6 +670,19 @@ def _compact_lines(res: dict) -> list[str]:
                 lines.append(f"  {platform:<14} {h['url']}")
                 if h["title"]:
                     lines.append(f"  {'':<14}   {h['title'][:110]}")
+
+    found = res.get("contacts") or {}
+    if found.get("emails") or found.get("phones"):
+        lines.append("## CONTACTS FOUND IN RESULT SNIPPETS")
+        for e in found.get("emails", []):
+            lines.append(f"  email  {e['email']}")
+            lines.append(f"         seen in: {e['sources'][0][:90]}")
+        for ph in found.get("phones", []):
+            lines.append(f"  phone  {ph['e164']}  {ph['country']} ({ph['confidence']})")
+    if res.get("searx_unresponsive"):
+        lines.append("## SEARXNG UPSTREAMS THAT FAILED")
+        for k, v in list(res["searx_unresponsive"].items())[:8]:
+            lines.append(f"  {k:<16} {v}")
 
     lines.append(f"## ALL RESULTS ({len(res['results'])}, most-agreed first)")
     for r in res["results"][:80]:
@@ -599,9 +708,12 @@ def build_parser() -> argparse.ArgumentParser:
                 '  python -m osint.websearch --person "Cagan Efe Calidag"\n'
                 '  python -m osint.websearch --person "Ada Lovelace" '
                 '--handle adalovelace --extra "Istanbul"\n'
-                f'\nengines: {", ".join(ENGINES)}\n'
-                'keyed engines activate when their env var is set: '
-                f'{", ".join(f"{k}={v}" for k, v in KEYED_ENGINES.items())}\n'),
+                '  python -m osint.websearch --person "Ada Lovelace" '
+                '--kinds contact,documents\n'
+                f'\nengines (all keyless): {", ".join(ENGINES)}\n'
+                f'dork groups: {", ".join(DORKS)}\n'
+                'Set $SEARX_URL to your own SearXNG instance — it is a\n'
+                "meta-engine and the only free route to Google's index.\n"),
     )
     p.add_argument("query", nargs="?", default="", help="Raw search query.")
     p.add_argument("--person", default="", help="Full name — run the social dork set.")
@@ -609,6 +721,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extra", default="", help="Disambiguating terms (employer, city).")
     p.add_argument("--engines", default="",
                    help=f"Comma-separated subset of: {', '.join(ENGINES)}")
+    p.add_argument("--kinds", default="",
+                   help=f"Dork groups to run: {', '.join(DORKS)} (default all but "
+                        "professional).")
+    p.add_argument("--region", default="",
+                   help="ISO code so phone numbers in snippets can be read.")
     p.add_argument("--count", type=int, default=20, help="Results per engine (default 20).")
     p.add_argument("--max-queries", type=int, default=12,
                    help="Cap dork queries in --person mode (default 12).")
@@ -629,9 +746,11 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
     try:
+        kinds = tuple(k.strip() for k in args.kinds.split(",") if k.strip())
         res = run(args.query, person=args.person, handle=args.handle, extra=args.extra,
                   engines=engines, count=args.count, max_queries=args.max_queries,
-                  timeout=args.timeout)
+                  timeout=args.timeout, region=args.region,
+                  **({"kinds": kinds} if kinds else {}))
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

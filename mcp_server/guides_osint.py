@@ -216,7 +216,7 @@ FAILURE / RETRY
 """
 
 WEBSEARCH = """\
-Query up to 12 search engines in parallel and merge the results by agreement.
+Query four keyless engines in parallel and merge the results by agreement.
 
 WHEN TO USE
   - To cover the login-walled platforms (Instagram, Facebook, Pinterest, Reddit,
@@ -227,9 +227,17 @@ WHEN TO USE
 
 INPUT
   query: a raw query. Full operator support — site:, quotes, OR.
-  person + handle + extra: dork mode. Runs the name against every major social
-    platform automatically. `extra` (employer, city, university) is what turns
-    10,000 "John Smith" hits into 5 — always pass it for a common name.
+  person + handle + extra: dork mode. `extra` (employer, city, university) is
+    what turns 10,000 "John Smith" hits into 5 — always pass it for a common name.
+  kinds: which dork groups to run —
+    identity    the name alone, plus bio/profile/about
+    contact     email/phone wording and "@gmail.com"-style literals. The point
+                is the SNIPPET: engines print the address next to the name, so
+                `contacts` in the result often has it without fetching anything.
+    documents   filetype:pdf/doc CVs — where phone numbers and addresses live
+    academic    site:edu / university / researcher wording, for staff and
+                student pages, which publish institutional addresses
+  Use site_dorks() to mine a domain once it is known to be relevant.
 
 OUTPUT
   results ranked by `agreement` = how many engines returned that URL. A URL found
@@ -243,9 +251,14 @@ WHAT TO DO NEXT
   is common.
 
 FAILURE / RETRY
-  Engines rate-limit constantly and the mix changes minute to minute — retry once
-  before concluding something isn't there. A SearXNG instance ($SEARX_URL) is by
-  far the best single upgrade: it is itself a meta-engine over Google/Bing/Brave.
+  Engines rate-limit constantly — retry once before concluding something isn't
+  there. `searx_unresponsive` names the upstreams that failed inside SearXNG:
+  "3 results" usually means Brave and DuckDuckGo were captcha'd, NOT that the
+  person has no footprint. Say that rather than reporting an empty finding.
+  A SearXNG instance ($SEARX_URL) is by far the best upgrade — it is a
+  meta-engine and the only free route to Google. Enable `google` and `bing` in
+  its settings; a stock instance often has only `google cse`, which is limited
+  to a handful of results.
 """
 
 LINKEDIN = """\
