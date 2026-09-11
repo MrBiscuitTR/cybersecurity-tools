@@ -194,3 +194,72 @@ def test_main_no_args_returns_2():
 
 def test_main_rejects_bad_category():
     assert username.main(["x", "--category", "nonsense"]) == 1
+
+
+def test_control_handles_mirror_the_swept_shapes():
+    """Bugcrowd 404s a plain random handle but serves 200 for any
+    letters.letters one, so a single plain control called it reliable while
+    every first.last candidate came back a false hit."""
+    plain = username._control_handles(["torvalds"])
+    assert len(plain) == 1 and "." not in plain[0]
+
+    dotted = username._control_handles(["cagan.calidag", "torvalds"])
+    assert any("." in c for c in dotted)
+
+    mixed = username._control_handles(["a.b", "c_d", "e-f"])
+    assert {any("." in c for c in mixed), any("_" in c for c in mixed),
+            any("-" in c for c in mixed)} == {True}
+
+
+def test_control_handles_are_random_each_call():
+    assert username._control_handles(["x"]) != username._control_handles(["x"])
+
+
+def test_a_site_that_finds_any_control_shape_is_quarantined(monkeypatch):
+    """The shape-specific liar: 404s plain handles, 200s anything with a dot."""
+    monkeypatch.setattr(username, "SITES",
+                        [username.Site("dotliar", "https://d.test/{u}", "dev")])
+
+    def fake_get(url, **kw):
+        handle = url.rsplit("/", 1)[-1]
+        return _resp(200 if "." in handle else 404)
+
+    monkeypatch.setattr(username.fetch, "get", fake_get)
+    res = username.run(["real.person"])
+    assert res["unreliable_sites"] == ["dotliar"]
+    assert res["found"] == []
+
+
+@pytest.mark.parametrize("site", ["bugcrowd", "codepen"])
+def test_false_positive_sites_removed(site):
+    """bugcrowd 200s for any letters.letters handle; codepen serves a RANDOM
+    real profile for a handle that does not exist. Neither can be made safe."""
+    assert site not in {s.name for s in username.SITES}
+
+
+def test_hit_is_unverified_when_the_control_was_blocked(monkeypatch):
+    """CodePen answers a random handle with a real profile from behind a
+    Cloudflare wall: its control probe 403s, so nothing contradicts the hit.
+    Reporting that as verified is exactly the false confidence to avoid."""
+    monkeypatch.setattr(username, "SITES",
+                        [username.Site("walled", "https://w.test/{u}", "dev")])
+
+    def fake_get(url, **kw):
+        handle = url.rsplit("/", 1)[-1]
+        return _resp(200) if handle == "real" else _resp(403)
+
+    monkeypatch.setattr(username.fetch, "get", fake_get)
+    res = username.run(["real"])
+    assert res["found"] == []
+    assert [u["site"] for u in res["unverified"]] == ["walled"]
+    assert res["unverified_sites"] == ["walled"]
+
+
+def test_clean_control_keeps_the_hit_in_found(monkeypatch):
+    monkeypatch.setattr(username, "SITES",
+                        [username.Site("honest", "https://h.test/{u}", "dev")])
+    monkeypatch.setattr(username.fetch, "get",
+                        lambda url, **k: _resp(200 if url.endswith("/real") else 404))
+    res = username.run(["real"])
+    assert [h["site"] for h in res["found"]] == ["honest"]
+    assert res["unverified"] == []

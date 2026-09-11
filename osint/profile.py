@@ -46,6 +46,7 @@ import re
 import sys
 import zlib
 from typing import Any
+import urllib.parse as up
 from urllib.parse import urljoin, urlparse
 
 from common.output import emit, log
@@ -464,6 +465,10 @@ def classify_link(url: str) -> dict | None:
             target = f"{p.path}?{p.query}" if not max_segs else (p.path or "/")
             m = re.search(pat, target) if pat else None
             handle = m.group(1) if m and m.groups() else ""
+        # URLs percent-encode non-ASCII, so a handle arrives as
+        # "deniz-h%C3%B6nigs". Decode it — the readable form is what matches a
+        # name, and what a human needs to see.
+        handle = up.unquote(handle)
         if not handle or handle.lower() in RESERVED_HANDLES:
             continue
         return {"platform": platform, "handle": handle, "url": url}

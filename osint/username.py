@@ -2,10 +2,15 @@
 
 Sherlock-style tools have one structural weakness: a lot of sites return HTTP 200
 for *every* profile URL (bot walls, SPAs, soft-404s), so those tools confidently
-report accounts that don't exist. This one probes a random control handle against
-each site in the same run. Any site that claims the control exists is marked
-UNRELIABLE and its "hit" is quarantined instead of reported. Empirically that
-catches pypi, steam, wordpress, pinterest and friends every time.
+report accounts that don't exist. This one probes RANDOM CONTROL HANDLES against
+each site in the same run, one per separator style actually being swept. Any site
+that claims a control exists is marked UNRELIABLE and its "hit" is quarantined
+instead of reported. Empirically that catches pypi, steam, wordpress, pinterest
+and friends every time.
+
+Matching the control's shape matters: Bugcrowd 404s "qz3f9a1c0b2d4e" but serves a
+generic 200 for any ``letters.letters`` handle, so a single plain control called
+it reliable while every ``first.last`` candidate came back a false hit.
 
 Takes a LIST of handles, because a person is not one string — you'll sweep
 ``cagancalidag``, ``caganefecalidag``, ``caganc`` and ``ccalidag`` together and
@@ -15,7 +20,7 @@ by model, then pass it here.
 Every result carries one of five states:
     found       account exists (and the site proved it rejects the control)
     absent      the site says no such user
-    unreliable  the site also "found" a random 14-char control handle
+    unreliable  the site also "found" a random control handle of the same shape
     unknown     blocked (403/429), timed out, or ambiguous — retry or open it
     manual      genuinely uncheckable (no addressable profile URL, or a bot wall
                 on every request) — the URL is emitted, never a guess
@@ -121,13 +126,16 @@ SITES: list[Site] = [
     Site("launchpad", "https://launchpad.net/~{u}", "dev"),
     Site("keybase", "https://keybase.io/{u}", "dev"),
     Site("npm", "https://www.npmjs.com/~{u}", "dev", absent_status=(404, 403)),
-    Site("codepen", "https://codepen.io/{u}", "dev"),
+    # codepen removed: for a handle that does not exist it serves a RANDOM real
+    # user's profile with a 200 ("codepen.io/deniz.honigs" -> "mehmet on
+    # CodePen"), and it sits behind Cloudflare so the control probe usually 403s
+    # rather than catching it. A soft-404 you can detect; an arbitrary valid
+    # profile you cannot.
     Site("leetcode", "https://leetcode.com/u/{u}/", "dev"),
     Site("codeforces", "https://codeforces.com/profile/{u}", "dev",
          probe_url="https://codeforces.com/api/user.info?handles={u}",
          absent_status=(400, 404)),
     Site("hackerone", "https://hackerone.com/{u}", "dev"),
-    Site("bugcrowd", "https://bugcrowd.com/{u}", "dev"),
     Site("hackernews", "https://news.ycombinator.com/user?id={u}", "dev",
          mode="text", absent_text="No such user"),
     Site("pypi", "https://pypi.org/user/{u}/", "dev", mode="manual",
@@ -372,10 +380,33 @@ def _parse_profile_meta(title: str, description: str) -> tuple[str, dict[str, st
     return name, stats
 
 
-def _control_handle() -> str:
-    """A handle no human plausibly registered, to catch sites that say yes to
-    everything. Random per run so a cached answer can't fool it."""
-    return "qz" + secrets.token_hex(7)
+def _control_handles(users: list[str]) -> list[str]:
+    """Control handles that mirror the SHAPE of the ones being swept.
+
+    A single plain control is not enough. Bugcrowd, for instance, 404s
+    "qz3f9a1c0b2d4e" but serves a generic 200 for any ``letters.letters``
+    handle — and ``first.last`` is one of the commonest shapes we generate, so
+    every dotted candidate came back as a hit. Emitting one control per
+    separator actually present in the sweep catches that whole class of
+    shape-dependent false positive.
+
+    Args:
+        users: The handles about to be checked.
+
+    Returns:
+        1-4 random handles, one per separator style in use. Random per run so a
+        cached answer cannot fool the check.
+    """
+    def word() -> str:
+        # Letters only: some sites treat a digit as "obviously not a username"
+        # and 404 it while happily accepting an all-letter one.
+        return "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(7))
+
+    controls = [word() + secrets.token_hex(3)]
+    for sep in (".", "_", "-"):
+        if any(sep in u for u in users):
+            controls.append(f"{word()}{sep}{word()}")
+    return controls
 
 
 def run(
@@ -413,7 +444,7 @@ def run(
             output; leave it on.
 
     Returns:
-        ``{"usernames","checked_sites","control_username","found","unreliable",
+        ``{"usernames","checked_sites","control_usernames","found","unreliable",
         "unknown","manual","per_username","absent_counts","next_steps"}``.
         ``found`` is flat across handles so cross-handle patterns are visible.
 
@@ -434,11 +465,11 @@ def run(
 
     sites = [s for s in SITES if not categories or s.category in categories]
     probed = [s for s in sites if s.mode != "manual"]
-    ctrl = _control_handle()
+    controls = _control_handles(users) if control else []
 
-    todo = list(users) + ([ctrl] if control else [])
+    todo = list(users) + controls
     log(f"[*] {len(users)} handle(s) x {len(probed)} sites"
-        + (f" + {len(probed)} control probes" if control else "")
+        + (f" + {len(probed) * len(controls)} control probes" if control else "")
         + f" = {len(probed) * len(todo)} requests "
           f"({len(probed)} sites in parallel, handles sequential per site) ...")
 
@@ -522,10 +553,21 @@ def run(
             for chunk in pool.map(retry_site, grouped.items()):
                 raw.update(chunk)
 
+    # A site is unreliable if it "finds" ANY of the controls.
     unreliable_sites = {s.name for s in probed
-                        if control and raw.get((s.name, ctrl), {}).get("state") == "found"}
+                        if any(raw.get((s.name, c), {}).get("state") == "found"
+                               for c in controls)}
+    # And a site whose controls all came back blocked/errored proved NOTHING.
+    # Treating those hits as verified is how CodePen — which answers a random
+    # "qwertyx.zxcvbnm" with "Quentin on CodePen" behind a Cloudflare wall —
+    # slipped through: its control probe 403'd, so nothing contradicted it.
+    unverified_sites = {
+        s.name for s in probed
+        if controls and s.name not in unreliable_sites
+        and all(raw.get((s.name, c), {}).get("state") in ("unknown", None)
+                for c in controls)}
 
-    found, unreliable, unknown = [], [], []
+    found, unreliable, unknown, unverified = [], [], [], []
     per_user: dict[str, dict] = {u: {"found": [], "unknown": 0, "absent": 0} for u in users}
     for s in probed:
         for u in users:
@@ -533,11 +575,18 @@ def run(
             if s.name in unreliable_sites:
                 if res["state"] == "found":
                     unreliable.append({**res, "state": "unreliable",
-                                       "note": "site also 'found' the random control handle"})
+                                       "note": "site also 'found' a random control handle of the "
+                             "same shape"})
                 continue
             if res["state"] == "found":
-                found.append(res)
-                per_user[u]["found"].append(s.name)
+                if s.name in unverified_sites:
+                    unverified.append({**res, "state": "unverified",
+                                       "note": "the control probe for this site was "
+                                               "blocked, so nothing proves the site "
+                                               "rejects made-up handles"})
+                else:
+                    found.append(res)
+                    per_user[u]["found"].append(s.name)
             elif res["state"] == "absent":
                 per_user[u]["absent"] += 1
             else:
@@ -549,7 +598,7 @@ def run(
                "note": s.note or "login-walled; open to confirm"}
               for s in sites if s.mode == "manual" for u in users]
 
-    for bucket in (found, unreliable, unknown, manual):
+    for bucket in (found, unreliable, unknown, unverified, manual):
         bucket.sort(key=lambda r: (r["username"], r["category"], r["site"]))
 
     next_steps = [
@@ -571,9 +620,11 @@ def run(
             "'yes' to any handle.")
 
     return {"usernames": users, "invalid": bad, "checked_sites": len(probed),
-            "control_username": ctrl if control else "",
+            "control_usernames": controls,
             "unreliable_sites": sorted(unreliable_sites),
+            "unverified_sites": sorted(unverified_sites),
             "found": found, "unreliable": unreliable, "unknown": unknown,
+            "unverified": unverified,
             "manual": manual, "per_username": per_user, "next_steps": next_steps}
 
 
@@ -597,6 +648,12 @@ def _compact_lines(res: dict, show_all: bool = False) -> list[str]:
             lines.append(f"  {'':<18}   note: {r['note']}")
     if not res["found"]:
         lines.append("  (none)")
+
+    if res.get("unverified"):
+        lines.append(f"## UNVERIFIED ({len(res['unverified'])}) — the site answered, "
+                     f"but its control probe was blocked, so the hit is unproven")
+        for r in res["unverified"]:
+            lines.append(f"  {r['username']:<18} {r['site']:<16} {r['url']}")
 
     if res["unreliable"]:
         lines.append(f"## UNRELIABLE ({len(res['unreliable'])}) — these sites say yes to "

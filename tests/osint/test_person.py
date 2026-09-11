@@ -95,7 +95,7 @@ def test_username_hits_become_scored_accounts(monkeypatch):
     import osint.username as username_mod
     monkeypatch.setattr(username_mod, "run", lambda handles, **kw: {
         "usernames": list(handles), "invalid": [], "checked_sites": 2,
-        "control_username": "", "unreliable_sites": [],
+        "control_usernames": [], "unreliable_sites": [],
         "found": [{"site": "github", "category": "dev", "username": "ada",
                    "url": "https://github.com/ada", "state": "found",
                    "http": 200, "note": ""}],
